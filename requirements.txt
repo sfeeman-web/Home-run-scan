@@ -1,0 +1,7 @@
+pandas>=2.2
+numpy>=1.26
+requests>=2.31
+pybaseball>=2.2.7
+xlsxwriter>=3.2
+
+streamlit>=1.42

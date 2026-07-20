@@ -1,0 +1,8 @@
+{
+  "contact_quality": 0.3,
+  "pitcher_vulnerability": 0.25,
+  "pitch_mix_matchup": 0.15,
+  "park_environment": 0.15,
+  "regression_due": 0.1,
+  "market_value": 0.05
+}

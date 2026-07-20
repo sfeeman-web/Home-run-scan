@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import time
 from dataclasses import dataclass
@@ -161,11 +162,30 @@ def team_id_map() -> dict[str, int]:
 
 
 def pull_statcast(start_dt: str, end_dt: str) -> pd.DataFrame:
-    df = statcast(start_dt=start_dt, end_dt=end_dt, verbose=False, parallel=True)
+    """
+    Memory-conscious Statcast pull for Streamlit Community Cloud.
+    Parallel requests are disabled and unused columns are discarded immediately.
+    """
+    df = statcast(
+        start_dt=start_dt,
+        end_dt=end_dt,
+        verbose=False,
+        parallel=False,
+    )
     if df is None or df.empty:
         return pd.DataFrame()
+
     df.columns = [str(c) for c in df.columns]
-    df["game_date"] = pd.to_datetime(df["game_date"])
+
+    needed = [
+        "game_date", "game_pk", "batter", "pitcher", "stand", "events",
+        "pitch_type", "launch_speed", "launch_angle", "hit_distance_sc",
+        "hc_x", "hc_y", "bat_score", "post_bat_score"
+    ]
+    keep = [c for c in needed if c in df.columns]
+    df = df.loc[:, keep].copy()
+    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    gc.collect()
     return df
 
 
@@ -436,7 +456,7 @@ def load_optional_inputs(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def run(game_date: str, output_dir: Path, lookback_days: int = 45, include_unconfirmed: bool = False) -> None:
+def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_unconfirmed: bool = False) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     games = schedule_for_date(game_date)
     ids = team_id_map()
@@ -448,13 +468,9 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 45, include_uncon
     if sc.empty:
         raise RuntimeError("No Statcast data returned.")
 
-    season_start = f"{pd.Timestamp(game_date).year}-03-01"
-    # Reuse the same range if it begins before season start; otherwise pull season data.
-    if pd.Timestamp(start) <= pd.Timestamp(season_start):
-        season_sc = sc
-    else:
-        print(f"Pulling pitcher season Statcast {season_start} through {end}...")
-        season_sc = pull_statcast(season_start, end)
+    # Use the same recent window for pitcher vulnerability and pitch-mix scoring.
+    # This avoids a second season-wide download that can exceed free-host memory.
+    season_sc = sc
 
     env = load_optional_inputs(Path("environment_inputs.csv"))
     odds = load_optional_inputs(Path("odds_inputs.csv"))
@@ -555,6 +571,7 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 45, include_uncon
             "Run with --include-unconfirmed for active-roster screening."
         )
     board = add_model_scores(board, weights)
+    gc.collect()
 
     pct_cols = [
         "HH_pct", "Barrel_pct_approx", "SweetSpot_pct", "PullAir_pct",
@@ -622,7 +639,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Last-10-game MLB HR scanner")
     parser.add_argument("--date", default=str(date.today()), help="YYYY-MM-DD")
     parser.add_argument("--output-dir", default="output")
-    parser.add_argument("--lookback-days", type=int, default=45)
+    parser.add_argument("--lookback-days", type=int, default=32)
     parser.add_argument(
         "--include-unconfirmed",
         action="store_true",

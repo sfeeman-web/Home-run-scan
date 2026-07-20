@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import io
 import math
 import time
 from dataclasses import dataclass
@@ -13,10 +14,20 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 import requests
-from pybaseball import statcast
 
 MLB_STATS = "https://statsapi.mlb.com/api/v1"
 LIVE_FEED = "https://statsapi.mlb.com/api/v1.1/game/{game_pk}/feed/live"
+
+SAVANT_CSV = (
+    "https://baseballsavant.mlb.com/statcast_search/csv?"
+    "all=true&hfPT=&hfAB=&hfBBT=&hfPR=&hfZ=&stadium=&hfBBL=&hfNewZones=&"
+    "hfGT=R%7CPO%7CS%7C=&hfSea=&hfSit=&player_type=pitcher&hfOuts=&"
+    "opponent=&pitcher_throws=&batter_stands=&hfSA=&"
+    "game_date_gt={start_dt}&game_date_lt={end_dt}&team=&position=&hfRO=&"
+    "home_road=&hfFlag=&metric_1=&hfInn=&min_pitches=0&min_results=0&"
+    "group_by=name&sort_col=pitches&player_event_sort=h_launch_speed&"
+    "sort_order=desc&min_abs=0&type=details"
+)
 
 BIP_EVENTS = {
     "single", "double", "triple", "home_run", "field_out", "force_out",
@@ -161,32 +172,115 @@ def team_id_map() -> dict[str, int]:
     }
 
 
-def pull_statcast(start_dt: str, end_dt: str) -> pd.DataFrame:
-    """
-    Memory-conscious Statcast pull for Streamlit Community Cloud.
-    Parallel requests are disabled and unused columns are discarded immediately.
-    """
-    df = statcast(
-        start_dt=start_dt,
-        end_dt=end_dt,
-        verbose=False,
-        parallel=False,
-    )
-    if df is None or df.empty:
-        return pd.DataFrame()
+def _coerce_statcast_types(df: pd.DataFrame) -> pd.DataFrame:
+    numeric_cols = [
+        "game_pk", "batter", "pitcher", "launch_speed", "launch_angle",
+        "hit_distance_sc", "hc_x", "hc_y", "bat_score", "post_bat_score"
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "game_date" in df.columns:
+        df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    return df
 
-    df.columns = [str(c) for c in df.columns]
+
+def _fetch_savant_day(day: str, probable_pitcher_ids: set[int]) -> pd.DataFrame:
+    """
+    Fetch one day directly from Baseball Savant and immediately discard
+    unnecessary pitch rows. We retain:
+      - terminal plate-appearance rows,
+      - all measured batted balls,
+      - all pitches thrown by today's probable starters.
+    """
+    url = SAVANT_CSV.format(start_dt=day, end_dt=day)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 Safari/604.1"
+        ),
+        "Accept": "text/csv,text/plain,*/*",
+    }
+    response = requests.get(url, headers=headers, timeout=60)
+    response.raise_for_status()
+
+    text = response.text
+    if not text.strip():
+        return pd.DataFrame()
+    if text.lstrip().lower().startswith("<!doctype html") or "<html" in text[:300].lower():
+        raise RuntimeError(
+            f"Baseball Savant returned an HTML page instead of CSV for {day}."
+        )
+
+    daily = pd.read_csv(io.StringIO(text), low_memory=False)
+    daily.columns = [str(c).strip() for c in daily.columns]
 
     needed = [
         "game_date", "game_pk", "batter", "pitcher", "stand", "events",
         "pitch_type", "launch_speed", "launch_angle", "hit_distance_sc",
         "hc_x", "hc_y", "bat_score", "post_bat_score"
     ]
-    keep = [c for c in needed if c in df.columns]
-    df = df.loc[:, keep].copy()
-    df["game_date"] = pd.to_datetime(df["game_date"], errors="coerce")
+    for col in needed:
+        if col not in daily.columns:
+            daily[col] = np.nan
+    daily = daily[needed].copy()
+    daily = _coerce_statcast_types(daily)
+
+    terminal = daily["events"].notna()
+    batted_ball = daily["launch_speed"].notna() & daily["launch_angle"].notna()
+    starter_pitch = daily["pitcher"].isin(probable_pitcher_ids)
+    daily = daily.loc[terminal | batted_ball | starter_pitch].copy()
+    return daily
+
+
+def pull_statcast(
+    start_dt: str,
+    end_dt: str,
+    probable_pitcher_ids: set[int] | None = None,
+) -> pd.DataFrame:
+    """
+    Direct Baseball Savant CSV ingestion.
+
+    The query is split into one-day requests because Savant caps large result
+    sets. Each day is filtered before concatenation, keeping memory stable on
+    Streamlit Community Cloud.
+    """
+    pitcher_ids = probable_pitcher_ids or set()
+    days = pd.date_range(start=start_dt, end=end_dt, freq="D")
+    frames: list[pd.DataFrame] = []
+    failures: list[str] = []
+
+    for idx, timestamp in enumerate(days, start=1):
+        day = timestamp.strftime("%Y-%m-%d")
+        print(f"Statcast day {idx}/{len(days)}: {day}", flush=True)
+        try:
+            daily = _fetch_savant_day(day, pitcher_ids)
+        except Exception as exc:
+            failures.append(f"{day}: {type(exc).__name__}: {exc}")
+            continue
+        if not daily.empty:
+            frames.append(daily)
+        gc.collect()
+
+    if not frames:
+        detail = "\n".join(failures[-5:])
+        raise RuntimeError(
+            "Baseball Savant returned no usable Statcast rows."
+            + (f"\nRecent request errors:\n{detail}" if detail else "")
+        )
+
+    combined = pd.concat(frames, ignore_index=True)
+    del frames
     gc.collect()
-    return df
+
+    if len(failures) > max(3, len(days) // 4):
+        detail = "\n".join(failures[-8:])
+        raise RuntimeError(
+            f"Too many Baseball Savant date requests failed "
+            f"({len(failures)} of {len(days)}).\n{detail}"
+        )
+
+    return combined
 
 
 def batting_side(row: pd.Series) -> str:
@@ -463,8 +557,14 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
 
     start = (pd.Timestamp(game_date) - pd.Timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     end = game_date
-    print(f"Pulling Statcast {start} through {end}...")
-    sc = pull_statcast(start, end)
+    probable_pitcher_ids = {
+        int(pid)
+        for game in games
+        for pid in (game.away_pitcher_id, game.home_pitcher_id)
+        if pid is not None
+    }
+    print(f"Pulling Statcast {start} through {end}...", flush=True)
+    sc = pull_statcast(start, end, probable_pitcher_ids)
     if sc.empty:
         raise RuntimeError("No Statcast data returned.")
 

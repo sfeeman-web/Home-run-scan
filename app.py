@@ -37,7 +37,7 @@ st.markdown(
 )
 
 st.title("⚾ Outlaw MLB Scanner")
-st.caption("Memory-light last-10 Statcast scanner for mobile use.")
+st.caption("Direct-Savant last-10 Statcast scanner for mobile use — v3.")
 
 with st.expander("Scanner model", expanded=False):
     st.markdown(
@@ -111,7 +111,7 @@ if st.button("Run Full Scan", type="primary", use_container_width=True):
     })
 
     with st.status("Running scanner...", expanded=True) as status:
-        st.write("Downloading one recent Statcast window...")
+        st.write("Downloading daily Baseball Savant CSV data...")
         st.write("Calculating last-10 contact and matchup metrics...")
         try:
             process = subprocess.run(

@@ -37,7 +37,7 @@ st.markdown(
 )
 
 st.title("⚾ Outlaw MLB Scanner")
-st.caption("Direct-Savant last-10 Statcast scanner for mobile use — v3.")
+st.caption("Calibrated Direct-Savant last-10 scanner — v4.")
 
 with st.expander("Scanner model", expanded=False):
     st.markdown(
@@ -46,8 +46,9 @@ with st.expander("Scanner model", expanded=False):
         15% pitch mix, 15% environment, 10% due indicators and 5% value.
 
         The mobile build uses a **32-day source window** to reconstruct each
-        hitter's 10 most recent games. Pitcher vulnerability also uses this
-        recent window so the app does not download the entire season twice.
+        hitter's 10 most recent games. Version 4 adds conservative xHR,
+        pitcher sample-size shrinkage, fixed scoring ranges, and a stricter
+        Core HR gate.
         """
     )
 
@@ -162,19 +163,24 @@ if csv_path.exists():
             if "Core_HR_Eligible" in board else 0
         )
         m2.metric("Core HR eligible", eligible)
-        top_score = board["Model_Score"].max() if "Model_Score" in board else float("nan")
+        top_score = board["HR_Score"].max() if "HR_Score" in board else float("nan")
         m3.metric("Top score", f"{top_score:.1f}" if pd.notna(top_score) else "—")
 
         preferred = [
-            "Model_Score","Core_HR_Eligible","Qualifying_Power_Signals",
+            "HR_Score","Core_HR_Eligible","Qualifying_Power_Signals","Sample_Flag",
             "player","team","opponent","lineup_spot","opposing_pitcher",
-            "AVG","H","HR","RBI","TB","Avg_EV","EV90","Max_EV",
-            "HH_95","HH_pct","EV_100_plus","EV_100_plus_outs",
-            "Barrels_approx","Barrel_pct_approx","Avg_LA",
-            "SweetSpot_pct","PullAir_pct","Fly_350_plus","Fly_375_plus",
-            "Out_380_400","Near_HR","xHR_proxy","xHR_minus_HR",
-            "Pitcher_HR_pct","Pitcher_HH_pct","Pitcher_Barrel_pct_approx",
-            "Pitch_Mix_Score","Park_Factor","Weather_Factor","HR_Odds_American"
+            "G","PA","AB","AVG","H","HR","RBI","TB","BBE",
+            "Avg_EV","EV90","Max_EV","HH_95","HH_pct",
+            "EV_100_plus","EV_100_plus_outs","Barrels_approx",
+            "Barrel_pct_approx","Avg_LA","SweetSpot_pct","PullAir_pct",
+            "Fly_350_plus","Fly_375_plus","Out_380_400","Near_HR",
+            "xHR_proxy","xHR_minus_HR",
+            "Pitcher_BBE","Pitcher_HR_pct_raw","Pitcher_HR_pct",
+            "Pitcher_HH_pct_raw","Pitcher_HH_pct",
+            "Pitcher_Barrel_pct_raw","Pitcher_Barrel_pct_approx",
+            "Pitcher_Sample_Reliability","Pitch_Mix_Score",
+            "Park_Factor","Weather_Factor","HR_Odds_American",
+            "Contact_Score","Pitcher_Vuln_Score","Due_Score"
         ]
         display_cols = [col for col in preferred if col in board.columns]
 

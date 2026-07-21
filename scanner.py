@@ -561,6 +561,15 @@ def fixed_scale(s: pd.Series, low: float, high: float) -> pd.Series:
 
 
 def add_model_scores(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
+    """
+    Version 5 calibration.
+
+    Main changes:
+    - Pitcher vulnerability is pulled toward 50 according to sample reliability.
+    - Due score is driven primarily by hard outs and near-HR contact.
+    - Core HR requires elite contact, sufficient sample, and a verified flight/pull path.
+    - A separate HR Watchlist preserves high-upside names that miss one Core gate.
+    """
     out = df.copy()
 
     bbe = pd.to_numeric(out["BBE"], errors="coerce").replace(0, np.nan)
@@ -583,31 +592,58 @@ def add_model_scores(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFram
     out["Hitter_Sample_Reliability"] = hitter_reliability
     out["Contact_Score"] = 50 + (contact_raw - 50) * hitter_reliability
 
-    pitcher_raw = (
+    pitcher_raw_score = (
         fixed_scale(out["Pitcher_HR_pct"], 0.03, 0.10) * 0.35
         + fixed_scale(out["Pitcher_HH_pct"], 0.32, 0.50) * 0.25
         + fixed_scale(out["Pitcher_Barrel_pct_approx"], 0.04, 0.12) * 0.25
         + fixed_scale(out["Pitcher_Avg_EV"], 86.5, 91.0) * 0.15
+    ).fillna(50)
+
+    out["Pitcher_Vuln_Score_Raw"] = pitcher_raw_score
+
+    pitcher_reliability = (
+        pd.to_numeric(out["Pitcher_Sample_Reliability"], errors="coerce")
+        .fillna(0)
+        .clip(0, 1)
     )
-    out["Pitcher_Vuln_Score"] = pitcher_raw.fillna(50)
+
+    # A low-sample pitcher matchup cannot create an extreme matchup score.
+    out["Pitcher_Vuln_Score"] = (
+        50 + (pitcher_raw_score - 50) * pitcher_reliability
+    ).clip(0, 100)
 
     out["Pitch_Mix_Score"] = out["Pitch_Mix_Score"].fillna(50).clip(0, 100)
 
-    park_environment = out["Park_Factor"].fillna(1.0) * out["Weather_Factor"].fillna(1.0)
-    out["Park_Env_Score"] = fixed_scale(park_environment, 0.90, 1.20).fillna(50)
-
-    xhr_gap = out["xHR_minus_HR"].fillna(0).clip(-1.0, 1.5)
-    due_raw = (
-        fixed_scale(xhr_gap, -1.0, 1.5) * 0.45
-        + fixed_scale(ev100_out_rate, 0.00, 0.20) * 0.30
-        + fixed_scale(out_380_rate, 0.00, 0.08) * 0.15
-        + fixed_scale(near_hr_rate, 0.00, 0.12) * 0.10
+    park_environment = (
+        out["Park_Factor"].fillna(1.0)
+        * out["Weather_Factor"].fillna(1.0)
     )
-    out["Due_Score"] = due_raw.fillna(50)
+    out["Park_Env_Score"] = fixed_scale(
+        park_environment, 0.90, 1.20
+    ).fillna(50)
 
-    out["Market_Value_Score"] = out["Market_Value_Score"].fillna(50).clip(0, 100)
+    # "Due" should mean hard contact that failed to become an HR.
+    positive_xhr_gap = out["xHR_minus_HR"].fillna(0).clip(lower=0, upper=1.5)
+    due_raw = (
+        fixed_scale(ev100_out_rate, 0.00, 0.20) * 0.40
+        + fixed_scale(near_hr_rate, 0.00, 0.12) * 0.30
+        + fixed_scale(out_380_rate, 0.00, 0.08) * 0.20
+        + fixed_scale(positive_xhr_gap, 0.00, 1.50) * 0.10
+    ).fillna(50)
 
-    out["Model_Score"] = (
+    # A hitter with no positive xHR gap can still be mildly due from lasers,
+    # but cannot receive an elite due score.
+    out["Due_Score"] = np.where(
+        out["xHR_minus_HR"].fillna(0) <= 0,
+        np.minimum(due_raw, 55),
+        due_raw,
+    )
+
+    out["Market_Value_Score"] = (
+        out["Market_Value_Score"].fillna(50).clip(0, 100)
+    )
+
+    out["HR_Score"] = (
         out["Contact_Score"] * weights["contact_quality"]
         + out["Pitcher_Vuln_Score"] * weights["pitcher_vulnerability"]
         + out["Pitch_Mix_Score"] * weights["pitch_mix_matchup"]
@@ -615,7 +651,8 @@ def add_model_scores(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFram
         + out["Due_Score"] * weights["regression_due"]
         + out["Market_Value_Score"] * weights["market_value"]
     )
-    out["HR_Score"] = out["Model_Score"]
+    out["Model_Score"] = out["HR_Score"]
+    out["Model_Version"] = "v5.1-top40"
 
     out["Qualifying_Power_Signals"] = (
         (
@@ -629,12 +666,12 @@ def add_model_scores(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFram
         + (out["EV_100_plus"].fillna(0) >= 4).astype(int)
         + (out["Fly_375_plus"].fillna(0) >= 2).astype(int)
         + (
-            (out["xHR_minus_HR"].fillna(0) > 0.75)
+            (out["xHR_minus_HR"].fillna(0) > 0.50)
             & (out["Near_HR"].fillna(0) >= 1)
         ).astype(int)
         + (
             (out["PullAir_pct"].fillna(0) >= 0.25)
-            & out["Avg_LA"].fillna(-99).between(12, 32)
+            & out["Avg_LA"].fillna(-99).between(8, 32)
         ).astype(int)
         + (out["HH_pct"].fillna(0) >= 0.50).astype(int)
     )
@@ -642,30 +679,98 @@ def add_model_scores(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFram
     active_status = out["status"].fillna("").str.lower().isin(
         ["scheduled", "pre-game", "warmup"]
     )
-    out["Core_HR_Eligible"] = (
-        (out["Qualifying_Power_Signals"] >= 4)
-        & (bbe.fillna(0) >= 15)
-        & (out["lineup_spot"].fillna(9) <= 6)
-        & active_status
+    top_six = out["lineup_spot"].fillna(9) <= 6
+    sample_gate = bbe.fillna(0) >= 15
+    contact_gate = out["Contact_Score"].fillna(0) >= 72
+    hard_hit_gate = out["HH_pct"].fillna(0) >= 0.45
+    barrel_gate = out["Barrel_pct_approx"].fillna(0) >= 0.10
+    signal_gate = out["Qualifying_Power_Signals"] >= 4
+
+    # A Core hitter must show an actual HR flight path:
+    # either 3+ deep balls, or a strong pulled-air profile with useful launch.
+    flight_shape_gate = (
+        (out["Fly_375_plus"].fillna(0) >= 3)
+        | (
+            (out["PullAir_pct"].fillna(0) >= 0.25)
+            & out["Avg_LA"].fillna(-99).between(8, 32)
+        )
     )
+
+    out["Core_HR_Eligible"] = (
+        active_status
+        & top_six
+        & sample_gate
+        & contact_gate
+        & hard_hit_gate
+        & barrel_gate
+        & signal_gate
+        & flight_shape_gate
+    )
+
+    # Preserve high-upside profiles that miss one or more strict Core gates.
+    out["HR_Watchlist"] = (
+        (~out["Core_HR_Eligible"])
+        & active_status
+        & top_six
+        & (bbe.fillna(0) >= 12)
+        & (out["Contact_Score"].fillna(0) >= 60)
+        & (out["Qualifying_Power_Signals"] >= 4)
+    )
+
+    def gate_reason(row: pd.Series) -> str:
+        if bool(row["Core_HR_Eligible"]):
+            return "PASS"
+        reasons: list[str] = []
+        row_bbe = float(row.get("BBE", 0) or 0)
+        if not str(row.get("status", "")).lower() in {
+            "scheduled", "pre-game", "warmup"
+        }:
+            reasons.append("status")
+        if pd.isna(row.get("lineup_spot")) or float(row.get("lineup_spot", 9)) > 6:
+            reasons.append("lineup")
+        if row_bbe < 15:
+            reasons.append("BBE<15")
+        if float(row.get("Contact_Score", 0) or 0) < 72:
+            reasons.append("contact<72")
+        if float(row.get("HH_pct", 0) or 0) < 0.45:
+            reasons.append("HH<45%")
+        if float(row.get("Barrel_pct_approx", 0) or 0) < 0.10:
+            reasons.append("barrel<10%")
+        if int(row.get("Qualifying_Power_Signals", 0) or 0) < 4:
+            reasons.append("signals<4")
+
+        flight_ok = (
+            float(row.get("Fly_375_plus", 0) or 0) >= 3
+            or (
+                float(row.get("PullAir_pct", 0) or 0) >= 0.25
+                and 8 <= float(row.get("Avg_LA", -99) or -99) <= 32
+            )
+        )
+        if not flight_ok:
+            reasons.append("flight/pull")
+        return "; ".join(reasons) if reasons else "not core"
+
+    out["Core_Gate_Reason"] = out.apply(gate_reason, axis=1)
 
     out["Sample_Flag"] = np.select(
         [
             bbe.fillna(0) < 8,
             bbe.fillna(0) < 15,
             out["Pitcher_BBE"].fillna(0) < 10,
+            out["Pitcher_Sample_Reliability"].fillna(0) < 0.35,
         ],
         [
             "Very small hitter sample",
             "Small hitter sample",
-            "Small pitcher-side sample",
+            "Very small pitcher-side sample",
+            "Limited pitcher-side sample",
         ],
         default="Stable",
     )
 
     return out.sort_values(
-        ["HR_Score", "Qualifying_Power_Signals"],
-        ascending=False,
+        ["HR_Score", "Core_HR_Eligible", "Qualifying_Power_Signals"],
+        ascending=[False, False, False],
     )
 
 
@@ -809,7 +914,8 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
             board[c] = board[c] * 100
 
     ordered = [
-        "HR_Score", "Model_Score", "Core_HR_Eligible",
+        "HR_Score", "Model_Score", "Model_Version",
+        "Core_HR_Eligible", "HR_Watchlist", "Core_Gate_Reason",
         "Qualifying_Power_Signals", "Sample_Flag",
         "player", "team", "opponent", "lineup_spot", "position", "bat_side",
         "opposing_pitcher", "G", "PA", "AB", "AVG", "H", "HR", "R", "RBI", "TB",
@@ -826,7 +932,8 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
         "Pitch_Mix_Score", "Park_Factor", "Weather_Factor",
         "temp_f", "wind_out_mph", "roof_status",
         "HR_Odds_American", "Market_Value_Score",
-        "Contact_Score", "Pitcher_Vuln_Score", "Park_Env_Score", "Due_Score",
+        "Contact_Score", "Pitcher_Vuln_Score_Raw",
+        "Pitcher_Vuln_Score", "Park_Env_Score", "Due_Score",
         "status", "game_pk", "player_id", "opposing_pitcher_id", "venue",
     ]
     ordered = [c for c in ordered if c in board.columns]
@@ -839,10 +946,17 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
         board.to_excel(writer, sheet_name="Ranked Board", index=False)
         core = board[board["Core_HR_Eligible"] == True].head(30)
         core.to_excel(writer, sheet_name="Core HR", index=False)
-        top20 = board.head(20)
-        top20.to_excel(writer, sheet_name="Top 20", index=False)
+        watchlist = board[board["HR_Watchlist"] == True].head(40)
+        watchlist.to_excel(writer, sheet_name="HR Watchlist", index=False)
+        top40 = board.head(40)
+        top40.to_excel(writer, sheet_name="Top 40", index=False)
         workbook = writer.book
-        for sheet_name, frame in [("Ranked Board", board), ("Core HR", core), ("Top 20", top20)]:
+        for sheet_name, frame in [
+            ("Ranked Board", board),
+            ("Core HR", core),
+            ("HR Watchlist", watchlist),
+            ("Top 40", top40),
+        ]:
             ws = writer.sheets[sheet_name]
             ws.freeze_panes(1, 4)
             ws.autofilter(0, 0, max(len(frame), 1), max(len(frame.columns) - 1, 0))

@@ -37,7 +37,7 @@ st.markdown(
 )
 
 st.title("⚾ Outlaw MLB Scanner")
-st.caption("Reliability-calibrated Direct-Savant scanner — v5.1 Top 40.")
+st.caption("Direct-Savant last-10 Statcast scanner — v3.1 Top 40.")
 
 with st.expander("Scanner model", expanded=False):
     st.markdown(
@@ -46,9 +46,8 @@ with st.expander("Scanner model", expanded=False):
         15% pitch mix, 15% environment, 10% due indicators and 5% value.
 
         The mobile build uses a **32-day source window** to reconstruct each
-        hitter's 10 most recent games. Version 5 directly tempers pitcher
-        matchup scores by sample reliability, prioritizes hard outs in the due
-        score, and separates strict Core HR targets from a secondary Watchlist.
+        hitter's 10 most recent games. Pitcher vulnerability also uses this
+        recent window so the app does not download the entire season twice.
         """
     )
 
@@ -156,44 +155,30 @@ if csv_path.exists():
         st.error(f"Results file could not be opened: {exc}")
     else:
         st.subheader("Top targets")
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3 = st.columns(3)
         m1.metric("Players scanned", len(board))
         eligible = (
             int(board["Core_HR_Eligible"].fillna(False).sum())
             if "Core_HR_Eligible" in board else 0
         )
         m2.metric("Core HR eligible", eligible)
-        watch_count = (
-            int(board["HR_Watchlist"].fillna(False).sum())
-            if "HR_Watchlist" in board else 0
-        )
-        m3.metric("Watchlist", watch_count)
-        top_score = board["HR_Score"].max() if "HR_Score" in board else float("nan")
-        m4.metric("Top score", f"{top_score:.1f}" if pd.notna(top_score) else "—")
+        top_score = board["Model_Score"].max() if "Model_Score" in board else float("nan")
+        m3.metric("Top score", f"{top_score:.1f}" if pd.notna(top_score) else "—")
 
         preferred = [
-            "HR_Score","Core_HR_Eligible","HR_Watchlist",
-            "Core_Gate_Reason","Qualifying_Power_Signals","Sample_Flag",
+            "Model_Score","Core_HR_Eligible","Qualifying_Power_Signals",
             "player","team","opponent","lineup_spot","opposing_pitcher",
-            "G","PA","AB","AVG","H","HR","RBI","TB","BBE",
-            "Avg_EV","EV90","Max_EV","HH_95","HH_pct",
-            "EV_100_plus","EV_100_plus_outs","Barrels_approx",
-            "Barrel_pct_approx","Avg_LA","SweetSpot_pct","PullAir_pct",
-            "Fly_350_plus","Fly_375_plus","Out_380_400","Near_HR",
-            "xHR_proxy","xHR_minus_HR",
-            "Pitcher_BBE","Pitcher_HR_pct_raw","Pitcher_HR_pct",
-            "Pitcher_HH_pct_raw","Pitcher_HH_pct",
-            "Pitcher_Barrel_pct_raw","Pitcher_Barrel_pct_approx",
-            "Pitcher_Sample_Reliability","Pitch_Mix_Score",
-            "Park_Factor","Weather_Factor","HR_Odds_American",
-            "Contact_Score","Pitcher_Vuln_Score_Raw",
-            "Pitcher_Vuln_Score","Due_Score"
+            "AVG","H","HR","RBI","TB","Avg_EV","EV90","Max_EV",
+            "HH_95","HH_pct","EV_100_plus","EV_100_plus_outs",
+            "Barrels_approx","Barrel_pct_approx","Avg_LA",
+            "SweetSpot_pct","PullAir_pct","Fly_350_plus","Fly_375_plus",
+            "Out_380_400","Near_HR","xHR_proxy","xHR_minus_HR",
+            "Pitcher_HR_pct","Pitcher_HH_pct","Pitcher_Barrel_pct_approx",
+            "Pitch_Mix_Score","Park_Factor","Weather_Factor","HR_Odds_American"
         ]
         display_cols = [col for col in preferred if col in board.columns]
 
-        tab1, tab2, tab3, tab4 = st.tabs(
-            ["Top 40", "Core HR", "Watchlist", "Full board"]
-        )
+        tab1, tab2, tab3 = st.tabs(["Top 40", "Core HR", "Full board"])
         with tab1:
             st.dataframe(
                 board[display_cols].head(40),
@@ -216,20 +201,6 @@ if csv_path.exists():
                         height=650,
                     )
         with tab3:
-            if "HR_Watchlist" not in board:
-                st.info("Watchlist field is unavailable.")
-            else:
-                watch = board[board["HR_Watchlist"] == True]
-                if watch.empty:
-                    st.info("No hitters currently meet the Watchlist gate.")
-                else:
-                    st.dataframe(
-                        watch[display_cols].head(40),
-                        use_container_width=True,
-                        hide_index=True,
-                        height=650,
-                    )
-        with tab4:
             st.dataframe(
                 board[display_cols],
                 use_container_width=True,

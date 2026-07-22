@@ -312,28 +312,18 @@ def is_barrel_row(ev: float, la: float) -> bool:
 
 def expected_hr_proxy(ev: float, la: float, distance: float | None) -> float:
     """
-    Conservative custom xHR proxy, not MLB's official xHR.
-
-    Exit velocity, launch angle, and distance must all cooperate. The previous
-    additive version awarded too much probability to ordinary contact.
+    Transparent custom xHR proxy, not MLB's official xHR.
+    Uses EV, launch angle, and projected distance when available.
     """
     if pd.isna(ev) or pd.isna(la):
         return 0.0
-
-    ev_component = 1 / (1 + math.exp(-(ev - 101.5) / 3.2))
-    angle_component = math.exp(-((la - 28.0) ** 2) / (2 * 7.5 ** 2))
-
+    ev_component = 1 / (1 + math.exp(-(ev - 101.5) / 3.0))
+    angle_component = math.exp(-((la - 28.0) ** 2) / (2 * 10.0 ** 2))
     if distance is None or pd.isna(distance):
-        distance_component = 0.35
+        dist_component = 0.45
     else:
-        distance_component = 1 / (1 + math.exp(-(distance - 390.0) / 15.0))
-
-    probability = (
-        ev_component
-        * angle_component
-        * (0.35 + 0.65 * distance_component)
-    )
-    return float(np.clip(probability, 0, 0.95))
+        dist_component = 1 / (1 + math.exp(-(distance - 385.0) / 16.0))
+    return float(np.clip(0.45 * ev_component + 0.30 * angle_component + 0.25 * dist_component, 0, 1))
 
 
 def last_n_games_for_batter(df: pd.DataFrame, batter_id: int, n: int = 10) -> pd.DataFrame:
@@ -438,112 +428,59 @@ def batted_ball_metrics(p: pd.DataFrame) -> dict[str, float]:
 
 
 def pitcher_vulnerability(df: pd.DataFrame, pitcher_id: int | None, batter_stand: str) -> dict[str, float]:
-    """
-    Recent pitcher contact allowed, stabilized toward league-average priors.
-
-    The shrinkage prevents tiny samples such as one HR in three BBE from being
-    treated as a true 33% HR rate.
-    """
-    prior_bbe = 40.0
-    prior_hr = 0.050
-    prior_hh = 0.380
-    prior_barrel = 0.075
-    prior_ev = 88.5
-
     if not pitcher_id:
         return {
-            "Pitcher_BBE": 0,
-            "Pitcher_HR": 0,
-            "Pitcher_HR_pct_raw": np.nan,
-            "Pitcher_HH_pct_raw": np.nan,
-            "Pitcher_Barrel_pct_raw": np.nan,
-            "Pitcher_HR_pct": prior_hr,
-            "Pitcher_HH_pct": prior_hh,
-            "Pitcher_Barrel_pct_approx": prior_barrel,
-            "Pitcher_Avg_EV": prior_ev,
-            "Pitcher_Sample_Reliability": 0.0,
+            "Pitcher_BBE": np.nan, "Pitcher_HR": np.nan, "Pitcher_HR_pct": np.nan,
+            "Pitcher_HH_pct": np.nan, "Pitcher_Barrel_pct_approx": np.nan,
+            "Pitcher_Avg_EV": np.nan,
         }
-
     p = df[df["pitcher"] == pitcher_id].copy()
     if batter_stand in {"L", "R"}:
         p = p[p["stand"] == batter_stand]
-
     b = p[is_bbe(p)].copy()
-    n = float(len(b))
-
     if b.empty:
         return {
-            "Pitcher_BBE": 0,
-            "Pitcher_HR": 0,
-            "Pitcher_HR_pct_raw": np.nan,
-            "Pitcher_HH_pct_raw": np.nan,
-            "Pitcher_Barrel_pct_raw": np.nan,
-            "Pitcher_HR_pct": prior_hr,
-            "Pitcher_HH_pct": prior_hh,
-            "Pitcher_Barrel_pct_approx": prior_barrel,
-            "Pitcher_Avg_EV": prior_ev,
-            "Pitcher_Sample_Reliability": 0.0,
+            "Pitcher_BBE": 0, "Pitcher_HR": 0, "Pitcher_HR_pct": np.nan,
+            "Pitcher_HH_pct": np.nan, "Pitcher_Barrel_pct_approx": np.nan,
+            "Pitcher_Avg_EV": np.nan,
         }
-
-    speed = pd.to_numeric(b["launch_speed"], errors="coerce")
-    angle = pd.to_numeric(b["launch_angle"], errors="coerce")
     b["barrel_approx"] = [
-        is_barrel_row(ev, la) for ev, la in zip(speed, angle)
+        is_barrel_row(ev, la)
+        for ev, la in zip(
+            pd.to_numeric(b["launch_speed"], errors="coerce"),
+            pd.to_numeric(b["launch_angle"], errors="coerce"),
+        )
     ]
-
-    hr_raw = float((b["events"] == "home_run").mean())
-    hh_raw = float((speed >= 95).mean())
-    barrel_raw = float(b["barrel_approx"].mean())
-    ev_raw = float(speed.mean())
-
-    def shrink(rate: float, prior: float) -> float:
-        return float((rate * n + prior * prior_bbe) / (n + prior_bbe))
-
     return {
-        "Pitcher_BBE": int(n),
+        "Pitcher_BBE": int(len(b)),
         "Pitcher_HR": int((b["events"] == "home_run").sum()),
-        "Pitcher_HR_pct_raw": hr_raw,
-        "Pitcher_HH_pct_raw": hh_raw,
-        "Pitcher_Barrel_pct_raw": barrel_raw,
-        "Pitcher_HR_pct": shrink(hr_raw, prior_hr),
-        "Pitcher_HH_pct": shrink(hh_raw, prior_hh),
-        "Pitcher_Barrel_pct_approx": shrink(barrel_raw, prior_barrel),
-        "Pitcher_Avg_EV": float((ev_raw * n + prior_ev * prior_bbe) / (n + prior_bbe)),
-        "Pitcher_Sample_Reliability": float(n / (n + prior_bbe)),
+        "Pitcher_HR_pct": float((b["events"] == "home_run").mean()),
+        "Pitcher_HH_pct": float((pd.to_numeric(b["launch_speed"], errors="coerce") >= 95).mean()),
+        "Pitcher_Barrel_pct_approx": float(b["barrel_approx"].mean()),
+        "Pitcher_Avg_EV": float(pd.to_numeric(b["launch_speed"], errors="coerce").mean()),
     }
 
 
 def pitch_mix_matchup_score(batter_rows: pd.DataFrame, pitcher_rows: pd.DataFrame) -> float:
     """
-    Score 0-100 using batter contact against the pitcher's primary pitch types.
-
-    Each pitch-type result is shrunk toward 50 when the batter sample is small.
+    Score 0-100 using batter damage on the pitcher's most-used pitch types.
+    This is a transparent matchup score, not a proprietary projection.
     """
     pitcher_usage = pitcher_rows["pitch_type"].value_counts(normalize=True).head(4)
     if pitcher_usage.empty:
         return 50.0
-
     scores = []
     weights = []
     for pitch_type, usage in pitcher_usage.items():
-        b = batter_rows[
-            (batter_rows["pitch_type"] == pitch_type)
-            & is_bbe(batter_rows)
-        ].copy()
-
+        b = batter_rows[(batter_rows["pitch_type"] == pitch_type) & is_bbe(batter_rows)].copy()
         if b.empty:
             score = 50.0
         else:
-            speed = pd.to_numeric(b["launch_speed"], errors="coerce")
-            ev = float(speed.mean())
-            hh = float((speed >= 95).mean())
-            raw_score = float(np.clip((ev - 84) * 4.5 + hh * 35, 0, 100))
-            reliability = len(b) / (len(b) + 12.0)
-            score = 50 + (raw_score - 50) * reliability
-
+            ev = pd.to_numeric(b["launch_speed"], errors="coerce").mean()
+            hh = (pd.to_numeric(b["launch_speed"], errors="coerce") >= 95).mean()
+            score = np.clip((ev - 82) * 4.0 + hh * 35, 0, 100)
         scores.append(score)
         weights.append(float(usage))
-
     return float(np.average(scores, weights=weights))
 
 
@@ -554,96 +491,37 @@ def normalize_series(s: pd.Series, low: float = 0, high: float = 100) -> pd.Seri
     return low + (s - s.min()) * (high - low) / (s.max() - s.min())
 
 
-def fixed_scale(s: pd.Series, low: float, high: float) -> pd.Series:
-    """Map a baseball metric to a stable 0-100 range."""
-    values = pd.to_numeric(s, errors="coerce")
-    return ((values - low) / (high - low) * 100).clip(0, 100)
-
-
 def add_model_scores(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
-    """
-    Version 5 calibration.
-
-    Main changes:
-    - Pitcher vulnerability is pulled toward 50 according to sample reliability.
-    - Due score is driven primarily by hard outs and near-HR contact.
-    - Core HR requires elite contact, sufficient sample, and a verified flight/pull path.
-    - A separate HR Watchlist preserves high-upside names that miss one Core gate.
-    """
     out = df.copy()
-
-    bbe = pd.to_numeric(out["BBE"], errors="coerce").replace(0, np.nan)
-    fly_375_rate = out["Fly_375_plus"].fillna(0) / bbe
-    near_hr_rate = out["Near_HR"].fillna(0) / bbe
-    ev100_out_rate = out["EV_100_plus_outs"].fillna(0) / bbe
-    out_380_rate = out["Out_380_400"].fillna(0) / bbe
-
     contact_raw = (
-        fixed_scale(out["Avg_EV"], 86, 95) * 0.15
-        + fixed_scale(out["EV90"], 98, 108) * 0.15
-        + fixed_scale(out["Max_EV"], 102, 113) * 0.10
-        + fixed_scale(out["HH_pct"], 0.35, 0.65) * 0.20
-        + fixed_scale(out["Barrel_pct_approx"], 0.05, 0.20) * 0.20
-        + fixed_scale(out["PullAir_pct"], 0.12, 0.40) * 0.10
-        + fixed_scale(fly_375_rate, 0.00, 0.15) * 0.10
+        out["Avg_EV"].fillna(out["Avg_EV"].median()) * 0.18
+        + out["EV90"].fillna(out["EV90"].median()) * 0.16
+        + out["Max_EV"].fillna(out["Max_EV"].median()) * 0.10
+        + out["HH_pct"].fillna(0) * 100 * 0.16
+        + out["Barrel_pct_approx"].fillna(0) * 100 * 0.16
+        + out["PullAir_pct"].fillna(0) * 100 * 0.10
+        + out["Fly_375_plus"].fillna(0) * 3.5
+        + out["Near_HR"].fillna(0) * 2.5
     )
-
-    hitter_reliability = (bbe.fillna(0) / 20.0).clip(0, 1)
-    out["Hitter_Sample_Reliability"] = hitter_reliability
-    out["Contact_Score"] = 50 + (contact_raw - 50) * hitter_reliability
-
-    pitcher_raw_score = (
-        fixed_scale(out["Pitcher_HR_pct"], 0.03, 0.10) * 0.35
-        + fixed_scale(out["Pitcher_HH_pct"], 0.32, 0.50) * 0.25
-        + fixed_scale(out["Pitcher_Barrel_pct_approx"], 0.04, 0.12) * 0.25
-        + fixed_scale(out["Pitcher_Avg_EV"], 86.5, 91.0) * 0.15
-    ).fillna(50)
-
-    out["Pitcher_Vuln_Score_Raw"] = pitcher_raw_score
-
-    pitcher_reliability = (
-        pd.to_numeric(out["Pitcher_Sample_Reliability"], errors="coerce")
-        .fillna(0)
-        .clip(0, 1)
+    pitcher_raw = (
+        out["Pitcher_HR_pct"].fillna(0) * 100 * 0.35
+        + out["Pitcher_HH_pct"].fillna(0) * 100 * 0.30
+        + out["Pitcher_Barrel_pct_approx"].fillna(0) * 100 * 0.25
+        + out["Pitcher_Avg_EV"].fillna(85) * 0.10
     )
-
-    # A low-sample pitcher matchup cannot create an extreme matchup score.
-    out["Pitcher_Vuln_Score"] = (
-        50 + (pitcher_raw_score - 50) * pitcher_reliability
-    ).clip(0, 100)
-
-    out["Pitch_Mix_Score"] = out["Pitch_Mix_Score"].fillna(50).clip(0, 100)
-
-    park_environment = (
-        out["Park_Factor"].fillna(1.0)
-        * out["Weather_Factor"].fillna(1.0)
-    )
-    out["Park_Env_Score"] = fixed_scale(
-        park_environment, 0.90, 1.20
-    ).fillna(50)
-
-    # "Due" should mean hard contact that failed to become an HR.
-    positive_xhr_gap = out["xHR_minus_HR"].fillna(0).clip(lower=0, upper=1.5)
     due_raw = (
-        fixed_scale(ev100_out_rate, 0.00, 0.20) * 0.40
-        + fixed_scale(near_hr_rate, 0.00, 0.12) * 0.30
-        + fixed_scale(out_380_rate, 0.00, 0.08) * 0.20
-        + fixed_scale(positive_xhr_gap, 0.00, 1.50) * 0.10
-    ).fillna(50)
-
-    # A hitter with no positive xHR gap can still be mildly due from lasers,
-    # but cannot receive an elite due score.
-    out["Due_Score"] = np.where(
-        out["xHR_minus_HR"].fillna(0) <= 0,
-        np.minimum(due_raw, 55),
-        due_raw,
+        out["xHR_minus_HR"].fillna(0) * 20
+        + out["EV_100_plus_outs"].fillna(0) * 3
+        + out["Out_380_400"].fillna(0) * 5
     )
+    out["Contact_Score"] = normalize_series(contact_raw)
+    out["Pitcher_Vuln_Score"] = normalize_series(pitcher_raw)
+    out["Pitch_Mix_Score"] = out["Pitch_Mix_Score"].fillna(50).clip(0, 100)
+    out["Park_Env_Score"] = normalize_series(out["Park_Factor"] * out["Weather_Factor"])
+    out["Due_Score"] = normalize_series(due_raw)
+    out["Market_Value_Score"] = out["Market_Value_Score"].fillna(50).clip(0, 100)
 
-    out["Market_Value_Score"] = (
-        out["Market_Value_Score"].fillna(50).clip(0, 100)
-    )
-
-    out["HR_Score"] = (
+    out["Model_Score"] = (
         out["Contact_Score"] * weights["contact_quality"]
         + out["Pitcher_Vuln_Score"] * weights["pitcher_vulnerability"]
         + out["Pitch_Mix_Score"] * weights["pitch_mix_matchup"]
@@ -651,127 +529,20 @@ def add_model_scores(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFram
         + out["Due_Score"] * weights["regression_due"]
         + out["Market_Value_Score"] * weights["market_value"]
     )
-    out["Model_Score"] = out["HR_Score"]
-    out["Model_Version"] = "v5.1-top40"
-
     out["Qualifying_Power_Signals"] = (
-        (
-            (out["Barrels_approx"].fillna(0) >= 3)
-            | (
-                (out["Barrel_pct_approx"].fillna(0) >= 0.12)
-                & (bbe.fillna(0) >= 15)
-            )
-        ).astype(int)
+        (out["Barrels_approx"].fillna(0) >= 2).astype(int)
         + (out["Max_EV"].fillna(0) >= 105).astype(int)
-        + (out["EV_100_plus"].fillna(0) >= 4).astype(int)
-        + (out["Fly_375_plus"].fillna(0) >= 2).astype(int)
-        + (
-            (out["xHR_minus_HR"].fillna(0) > 0.50)
-            & (out["Near_HR"].fillna(0) >= 1)
-        ).astype(int)
-        + (
-            (out["PullAir_pct"].fillna(0) >= 0.25)
-            & out["Avg_LA"].fillna(-99).between(8, 32)
-        ).astype(int)
-        + (out["HH_pct"].fillna(0) >= 0.50).astype(int)
+        + (out["EV_100_plus"].fillna(0) >= 2).astype(int)
+        + (out["Fly_375_plus"].fillna(0) >= 1).astype(int)
+        + (out["xHR_minus_HR"].fillna(0) > 0.35).astype(int)
+        + (out["PullAir_pct"].fillna(0) >= 0.20).astype(int)
     )
-
-    active_status = out["status"].fillna("").str.lower().isin(
-        ["scheduled", "pre-game", "warmup"]
-    )
-    top_six = out["lineup_spot"].fillna(9) <= 6
-    sample_gate = bbe.fillna(0) >= 15
-    contact_gate = out["Contact_Score"].fillna(0) >= 72
-    hard_hit_gate = out["HH_pct"].fillna(0) >= 0.45
-    barrel_gate = out["Barrel_pct_approx"].fillna(0) >= 0.10
-    signal_gate = out["Qualifying_Power_Signals"] >= 4
-
-    # A Core hitter must show an actual HR flight path:
-    # either 3+ deep balls, or a strong pulled-air profile with useful launch.
-    flight_shape_gate = (
-        (out["Fly_375_plus"].fillna(0) >= 3)
-        | (
-            (out["PullAir_pct"].fillna(0) >= 0.25)
-            & out["Avg_LA"].fillna(-99).between(8, 32)
-        )
-    )
-
     out["Core_HR_Eligible"] = (
-        active_status
-        & top_six
-        & sample_gate
-        & contact_gate
-        & hard_hit_gate
-        & barrel_gate
-        & signal_gate
-        & flight_shape_gate
+        (out["Qualifying_Power_Signals"] >= 2)
+        & (out["lineup_spot"].fillna(9) <= 6)
+        & (out["status"].str.lower().isin(["scheduled", "pre-game", "warmup"]))
     )
-
-    # Preserve high-upside profiles that miss one or more strict Core gates.
-    out["HR_Watchlist"] = (
-        (~out["Core_HR_Eligible"])
-        & active_status
-        & top_six
-        & (bbe.fillna(0) >= 12)
-        & (out["Contact_Score"].fillna(0) >= 60)
-        & (out["Qualifying_Power_Signals"] >= 4)
-    )
-
-    def gate_reason(row: pd.Series) -> str:
-        if bool(row["Core_HR_Eligible"]):
-            return "PASS"
-        reasons: list[str] = []
-        row_bbe = float(row.get("BBE", 0) or 0)
-        if not str(row.get("status", "")).lower() in {
-            "scheduled", "pre-game", "warmup"
-        }:
-            reasons.append("status")
-        if pd.isna(row.get("lineup_spot")) or float(row.get("lineup_spot", 9)) > 6:
-            reasons.append("lineup")
-        if row_bbe < 15:
-            reasons.append("BBE<15")
-        if float(row.get("Contact_Score", 0) or 0) < 72:
-            reasons.append("contact<72")
-        if float(row.get("HH_pct", 0) or 0) < 0.45:
-            reasons.append("HH<45%")
-        if float(row.get("Barrel_pct_approx", 0) or 0) < 0.10:
-            reasons.append("barrel<10%")
-        if int(row.get("Qualifying_Power_Signals", 0) or 0) < 4:
-            reasons.append("signals<4")
-
-        flight_ok = (
-            float(row.get("Fly_375_plus", 0) or 0) >= 3
-            or (
-                float(row.get("PullAir_pct", 0) or 0) >= 0.25
-                and 8 <= float(row.get("Avg_LA", -99) or -99) <= 32
-            )
-        )
-        if not flight_ok:
-            reasons.append("flight/pull")
-        return "; ".join(reasons) if reasons else "not core"
-
-    out["Core_Gate_Reason"] = out.apply(gate_reason, axis=1)
-
-    out["Sample_Flag"] = np.select(
-        [
-            bbe.fillna(0) < 8,
-            bbe.fillna(0) < 15,
-            out["Pitcher_BBE"].fillna(0) < 10,
-            out["Pitcher_Sample_Reliability"].fillna(0) < 0.35,
-        ],
-        [
-            "Very small hitter sample",
-            "Small hitter sample",
-            "Very small pitcher-side sample",
-            "Limited pitcher-side sample",
-        ],
-        default="Stable",
-    )
-
-    return out.sort_values(
-        ["HR_Score", "Core_HR_Eligible", "Qualifying_Power_Signals"],
-        ascending=[False, False, False],
-    )
+    return out.sort_values(["Model_Score", "Qualifying_Power_Signals"], ascending=False)
 
 
 def load_optional_inputs(path: Path) -> pd.DataFrame:
@@ -905,18 +676,14 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
 
     pct_cols = [
         "HH_pct", "Barrel_pct_approx", "SweetSpot_pct", "PullAir_pct",
-        "Pitcher_HR_pct_raw", "Pitcher_HH_pct_raw", "Pitcher_Barrel_pct_raw",
-        "Pitcher_HR_pct", "Pitcher_HH_pct", "Pitcher_Barrel_pct_approx",
-        "Hitter_Sample_Reliability", "Pitcher_Sample_Reliability"
+        "Pitcher_HR_pct", "Pitcher_HH_pct", "Pitcher_Barrel_pct_approx"
     ]
     for c in pct_cols:
         if c in board:
             board[c] = board[c] * 100
 
     ordered = [
-        "HR_Score", "Model_Score", "Model_Version",
-        "Core_HR_Eligible", "HR_Watchlist", "Core_Gate_Reason",
-        "Qualifying_Power_Signals", "Sample_Flag",
+        "Model_Score", "Core_HR_Eligible", "Qualifying_Power_Signals",
         "player", "team", "opponent", "lineup_spot", "position", "bat_side",
         "opposing_pitcher", "G", "PA", "AB", "AVG", "H", "HR", "R", "RBI", "TB",
         "BBE", "Avg_EV", "EV90", "Max_EV", "HH_95", "HH_pct",
@@ -924,16 +691,12 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
         "Avg_LA", "SweetSpot", "SweetSpot_pct", "PullAir", "PullAir_pct",
         "Fly_350_plus", "Fly_375_plus", "Out_380_400", "Near_HR",
         "xHR_proxy", "xHR_minus_HR",
-        "Pitcher_BBE", "Pitcher_HR",
-        "Pitcher_HR_pct_raw", "Pitcher_HH_pct_raw", "Pitcher_Barrel_pct_raw",
-        "Pitcher_HR_pct", "Pitcher_HH_pct",
+        "Pitcher_BBE", "Pitcher_HR", "Pitcher_HR_pct", "Pitcher_HH_pct",
         "Pitcher_Barrel_pct_approx", "Pitcher_Avg_EV",
-        "Pitcher_Sample_Reliability", "Hitter_Sample_Reliability",
         "Pitch_Mix_Score", "Park_Factor", "Weather_Factor",
         "temp_f", "wind_out_mph", "roof_status",
         "HR_Odds_American", "Market_Value_Score",
-        "Contact_Score", "Pitcher_Vuln_Score_Raw",
-        "Pitcher_Vuln_Score", "Park_Env_Score", "Due_Score",
+        "Contact_Score", "Pitcher_Vuln_Score", "Park_Env_Score", "Due_Score",
         "status", "game_pk", "player_id", "opposing_pitcher_id", "venue",
     ]
     ordered = [c for c in ordered if c in board.columns]
@@ -946,17 +709,10 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
         board.to_excel(writer, sheet_name="Ranked Board", index=False)
         core = board[board["Core_HR_Eligible"] == True].head(30)
         core.to_excel(writer, sheet_name="Core HR", index=False)
-        watchlist = board[board["HR_Watchlist"] == True].head(40)
-        watchlist.to_excel(writer, sheet_name="HR Watchlist", index=False)
         top40 = board.head(40)
         top40.to_excel(writer, sheet_name="Top 40", index=False)
         workbook = writer.book
-        for sheet_name, frame in [
-            ("Ranked Board", board),
-            ("Core HR", core),
-            ("HR Watchlist", watchlist),
-            ("Top 40", top40),
-        ]:
+        for sheet_name, frame in [("Ranked Board", board), ("Core HR", core), ("Top 40", top40)]:
             ws = writer.sheets[sheet_name]
             ws.freeze_panes(1, 4)
             ws.autofilter(0, 0, max(len(frame), 1), max(len(frame.columns) - 1, 0))

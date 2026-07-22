@@ -8,7 +8,7 @@ import json
 import math
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -54,6 +54,196 @@ PARK_FACTORS = {
     "TOR": 1.02
 }
 
+
+# Stadium coordinates and approximate home-plate-to-center-field bearings.
+# Bearings are used only to translate forecast wind into an outfield component.
+STADIUM_WEATHER = {
+    "ARI": (33.4453, -112.0667, 0.0, "retractable"),
+    "ATH": (38.0456, -122.5111, 40.0, "outdoor"),
+    "OAK": (38.0456, -122.5111, 40.0, "outdoor"),
+    "ATL": (33.8908, -84.4677, 20.0, "outdoor"),
+    "BAL": (39.2838, -76.6217, 45.0, "outdoor"),
+    "BOS": (42.3467, -71.0972, 55.0, "outdoor"),
+    "CHC": (41.9484, -87.6553, 30.0, "outdoor"),
+    "CWS": (41.8300, -87.6338, 15.0, "outdoor"),
+    "CIN": (39.0979, -84.5082, 55.0, "outdoor"),
+    "CLE": (41.4962, -81.6852, 15.0, "outdoor"),
+    "COL": (39.7559, -104.9942, 20.0, "outdoor"),
+    "DET": (42.3390, -83.0485, 10.0, "outdoor"),
+    "HOU": (29.7573, -95.3555, 25.0, "retractable"),
+    "KC": (39.0517, -94.4803, 45.0, "outdoor"),
+    "LAA": (33.8003, -117.8827, 20.0, "outdoor"),
+    "LAD": (34.0739, -118.2400, 25.0, "outdoor"),
+    "MIA": (25.7781, -80.2197, 15.0, "retractable"),
+    "MIL": (43.0280, -87.9712, 20.0, "retractable"),
+    "MIN": (44.9817, -93.2776, 45.0, "outdoor"),
+    "NYM": (40.7571, -73.8458, 45.0, "outdoor"),
+    "NYY": (40.8296, -73.9262, 65.0, "outdoor"),
+    "PHI": (39.9061, -75.1665, 15.0, "outdoor"),
+    "PIT": (40.4469, -80.0057, 25.0, "outdoor"),
+    "SD": (32.7076, -117.1570, 20.0, "outdoor"),
+    "SEA": (47.5914, -122.3325, 35.0, "retractable"),
+    "SF": (37.7786, -122.3893, 60.0, "outdoor"),
+    "STL": (38.6226, -90.1928, 15.0, "outdoor"),
+    "TB": (27.7683, -82.6534, 0.0, "dome"),
+    "TEX": (32.7473, -97.0848, 20.0, "retractable"),
+    "TOR": (43.6414, -79.3894, 25.0, "retractable"),
+    "WSH": (38.8730, -77.0074, 25.0, "outdoor"),
+}
+
+OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
+
+
+def _angle_difference(a: float, b: float) -> float:
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+
+def fetch_game_weather(game: GameContext) -> dict[str, Any]:
+    """Return forecast nearest first pitch. Neutral fallback on any failure."""
+    base = {
+        "game_time_utc": game.game_date,
+        "Weather_Factor": 1.0,
+        "weather_source": "Neutral fallback",
+        "roof_status": "",
+        "temp_f": np.nan,
+        "humidity_pct": np.nan,
+        "wind_speed_mph": np.nan,
+        "wind_direction_deg": np.nan,
+        "wind_out_mph": np.nan,
+        "precip_probability_pct": np.nan,
+        "weather_warning": "",
+    }
+    stadium = STADIUM_WEATHER.get(game.home)
+    if not stadium:
+        base["weather_warning"] = "Stadium weather mapping unavailable"
+        return base
+
+    lat, lon, cf_bearing, roof_type = stadium
+    if roof_type == "dome":
+        base.update({
+            "weather_source": "Indoor park",
+            "roof_status": "Closed/dome",
+            "weather_warning": "Indoor conditions",
+        })
+        return base
+    if roof_type == "retractable":
+        base["roof_status"] = "Unknown retractable"
+
+    try:
+        payload = get_json(OPEN_METEO, {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": ",".join([
+                "temperature_2m", "relative_humidity_2m",
+                "precipitation_probability", "wind_speed_10m",
+                "wind_direction_10m"
+            ]),
+            "temperature_unit": "fahrenheit",
+            "wind_speed_unit": "mph",
+            "timezone": "UTC",
+            "forecast_days": 3,
+        })
+        hourly = payload.get("hourly", {})
+        times = pd.to_datetime(hourly.get("time", []), utc=True, errors="coerce")
+        if len(times) == 0:
+            raise RuntimeError("No hourly forecast returned")
+        first_pitch = pd.to_datetime(game.game_date, utc=True)
+        idx = int(np.argmin(np.abs((times - first_pitch).total_seconds())))
+        temp = float(hourly["temperature_2m"][idx])
+        humidity = float(hourly["relative_humidity_2m"][idx])
+        precip = float(hourly["precipitation_probability"][idx])
+        wind_speed = float(hourly["wind_speed_10m"][idx])
+        wind_from = float(hourly["wind_direction_10m"][idx])
+        wind_toward = (wind_from + 180.0) % 360.0
+        angle = math.radians(_angle_difference(wind_toward, cf_bearing))
+        wind_out = wind_speed * math.cos(angle)
+
+        # Retractable-roof weather stays neutral unless a manual input confirms open.
+        if roof_type == "retractable":
+            factor = 1.0
+            warning = "ROOF STATUS UNCONFIRMED"
+        else:
+            temp_factor = float(np.clip(1.0 + (temp - 70.0) * 0.002, 0.95, 1.05))
+            wind_factor = float(np.clip(1.0 + wind_out * 0.006, 0.93, 1.08))
+            humidity_factor = float(np.clip(1.0 + (humidity - 50.0) * 0.0003, 0.985, 1.015))
+            factor = float(np.clip(temp_factor * wind_factor * humidity_factor, 0.90, 1.12))
+            if precip >= 70:
+                warning = "HIGH DELAY/POSTPONEMENT RISK"
+            elif precip >= 45:
+                warning = "Meaningful rain/delay risk"
+            elif precip >= 25:
+                warning = "Monitor rain"
+            else:
+                warning = ""
+
+        base.update({
+            "Weather_Factor": factor,
+            "weather_source": "Open-Meteo hourly forecast",
+            "temp_f": temp,
+            "humidity_pct": humidity,
+            "wind_speed_mph": wind_speed,
+            "wind_direction_deg": wind_from,
+            "wind_out_mph": round(wind_out, 1),
+            "precip_probability_pct": precip,
+            "weather_warning": warning,
+        })
+        return base
+    except Exception as exc:
+        base["weather_warning"] = f"Weather unavailable: {type(exc).__name__}"
+        return base
+
+
+def game_weather_map(games: list[GameContext], enabled: bool = True) -> dict[int, dict[str, Any]]:
+    if not enabled:
+        return {g.game_pk: {
+            "game_time_utc": g.game_date,
+            "Weather_Factor": 1.0,
+            "weather_source": "Automatic weather disabled",
+            "roof_status": "",
+            "temp_f": np.nan,
+            "humidity_pct": np.nan,
+            "wind_speed_mph": np.nan,
+            "wind_direction_deg": np.nan,
+            "wind_out_mph": np.nan,
+            "precip_probability_pct": np.nan,
+            "weather_warning": "",
+        } for g in games}
+    return {g.game_pk: fetch_game_weather(g) for g in games}
+
+
+def apply_manual_environment(weather: dict[str, Any], rec: pd.Series) -> dict[str, Any]:
+    """Manual CSV values override automatic fields when supplied."""
+    out = weather.copy()
+    mapping = {
+        "weather_factor": "Weather_Factor",
+        "roof_status": "roof_status",
+        "temp_f": "temp_f",
+        "humidity_pct": "humidity_pct",
+        "wind_speed_mph": "wind_speed_mph",
+        "wind_direction_deg": "wind_direction_deg",
+        "wind_out_mph": "wind_out_mph",
+        "precip_probability_pct": "precip_probability_pct",
+        "weather_warning": "weather_warning",
+    }
+    changed = False
+    for source, target in mapping.items():
+        if source in rec.index and pd.notna(rec[source]) and str(rec[source]).strip() != "":
+            value = rec[source]
+            if target not in {"roof_status", "weather_warning"}:
+                value = pd.to_numeric(value, errors="coerce")
+                if pd.isna(value):
+                    continue
+            out[target] = value
+            changed = True
+    roof = str(out.get("roof_status", "")).strip().lower()
+    if roof in {"closed", "closed/dome", "dome"}:
+        out["Weather_Factor"] = 1.0
+        out["wind_out_mph"] = 0.0
+        out["weather_warning"] = "Roof closed"
+    if changed:
+        out["weather_source"] = "Automatic forecast + manual override"
+    return out
+
 DEFAULT_WEIGHTS = {
     "contact_quality": 0.30,
     "pitcher_vulnerability": 0.25,
@@ -71,6 +261,7 @@ class GameContext:
     away: str
     home: str
     venue: str
+    venue_id: int | None
     status: str
     away_pitcher_id: int | None
     away_pitcher_name: str | None
@@ -113,6 +304,7 @@ def schedule_for_date(game_date: str) -> list[GameContext]:
                     away=teams["away"]["team"]["abbreviation"],
                     home=teams["home"]["team"]["abbreviation"],
                     venue=g.get("venue", {}).get("name", ""),
+                    venue_id=g.get("venue", {}).get("id"),
                     status=g.get("status", {}).get("detailedState", ""),
                     away_pitcher_id=away_prob.get("id"),
                     away_pitcher_name=away_prob.get("fullName"),
@@ -662,7 +854,13 @@ def load_optional_inputs(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_unconfirmed: bool = False) -> None:
+def run(
+    game_date: str,
+    output_dir: Path,
+    lookback_days: int = 32,
+    include_unconfirmed: bool = False,
+    auto_weather: bool = True,
+) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     games = schedule_for_date(game_date)
     ids = team_id_map()
@@ -685,6 +883,7 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
     season_sc = sc
 
     env = load_optional_inputs(Path("environment_inputs.csv"))
+    weather_by_game = game_weather_map(games, enabled=auto_weather)
     odds = load_optional_inputs(Path("odds_inputs.csv"))
     weights = DEFAULT_WEIGHTS.copy()
     weight_path = Path("weights.json")
@@ -731,18 +930,12 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
                 )
 
                 park_factor = PARK_FACTORS.get(park_team, 1.0)
-                weather_factor = 1.0
-                roof_status = ""
-                temp_f = np.nan
-                wind_out_mph = np.nan
+                weather = weather_by_game.get(game.game_pk, {}).copy()
                 if not env.empty and "game_pk" in env.columns:
                     m = env[env["game_pk"] == game.game_pk]
                     if not m.empty:
-                        rec = m.iloc[0]
-                        weather_factor = float(rec.get("weather_factor", 1.0))
-                        roof_status = rec.get("roof_status", "")
-                        temp_f = rec.get("temp_f", np.nan)
-                        wind_out_mph = rec.get("wind_out_mph", np.nan)
+                        weather = apply_manual_environment(weather, m.iloc[0])
+                weather_factor = float(weather.get("Weather_Factor", 1.0))
 
                 hr_odds = np.nan
                 market_value = 50.0
@@ -772,9 +965,16 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
                     "opposing_pitcher": pitcher_name,
                     "Park_Factor": park_factor,
                     "Weather_Factor": weather_factor,
-                    "roof_status": roof_status,
-                    "temp_f": temp_f,
-                    "wind_out_mph": wind_out_mph,
+                    "game_time_utc": weather.get("game_time_utc", game.game_date),
+                    "weather_source": weather.get("weather_source", ""),
+                    "roof_status": weather.get("roof_status", ""),
+                    "temp_f": weather.get("temp_f", np.nan),
+                    "humidity_pct": weather.get("humidity_pct", np.nan),
+                    "wind_speed_mph": weather.get("wind_speed_mph", np.nan),
+                    "wind_direction_deg": weather.get("wind_direction_deg", np.nan),
+                    "wind_out_mph": weather.get("wind_out_mph", np.nan),
+                    "precip_probability_pct": weather.get("precip_probability_pct", np.nan),
+                    "weather_warning": weather.get("weather_warning", ""),
                     "HR_Odds_American": hr_odds,
                     "Market_Value_Score": market_value,
                     **pitch_details,
@@ -820,8 +1020,10 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
         "Pitcher_FB_pct", "Pitcher_PullAir_Damage_pct", "Pitcher_Top_Pitches",
         "Pitcher_HR_Pitch_Types", "Pitcher_Primary_Velo", "Pitch_Mix_Score",
         "Pitch_Type_Matchup", "Velocity_Matchup_Score", "Velocity_Matchup",
-        "Park_Factor", "Weather_Factor",
-        "temp_f", "wind_out_mph", "roof_status",
+        "Park_Factor", "Weather_Factor", "game_time_utc",
+        "temp_f", "humidity_pct", "wind_speed_mph", "wind_direction_deg",
+        "wind_out_mph", "precip_probability_pct", "roof_status",
+        "weather_warning", "weather_source",
         "HR_Odds_American", "Market_Value_Score",
         "Contact_Score", "Pitcher_Vuln_Score", "Park_Env_Score", "Due_Score",
         "status", "game_pk", "player_id", "opposing_pitcher_id", "venue",
@@ -863,23 +1065,78 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
     print(f"Saved: {xlsx_path}")
 
 
+
+def refresh_weather_only(game_date: str, output_dir: Path, auto_weather: bool = True) -> None:
+    csv_path = output_dir / f"outlaw_scanner_{game_date}.csv"
+    xlsx_path = output_dir / f"outlaw_scanner_{game_date}.xlsx"
+    if not csv_path.exists():
+        raise RuntimeError("Run a full scan before refreshing weather.")
+    board = pd.read_csv(csv_path)
+    games = schedule_for_date(game_date)
+    weather_by_game = game_weather_map(games, enabled=auto_weather)
+    env = load_optional_inputs(Path("environment_inputs.csv"))
+
+    for game in games:
+        weather = weather_by_game.get(game.game_pk, {}).copy()
+        if not env.empty and "game_pk" in env.columns:
+            m = env[env["game_pk"] == game.game_pk]
+            if not m.empty:
+                weather = apply_manual_environment(weather, m.iloc[0])
+        mask = pd.to_numeric(board["game_pk"], errors="coerce") == game.game_pk
+        for col, value in weather.items():
+            board.loc[mask, col] = value
+
+    old_env = pd.to_numeric(board.get("Park_Env_Score"), errors="coerce").fillna(50)
+    board["Park_Env_Score"] = normalize_series(
+        pd.to_numeric(board["Park_Factor"], errors="coerce").fillna(1.0)
+        * pd.to_numeric(board["Weather_Factor"], errors="coerce").fillna(1.0)
+    )
+    weights = DEFAULT_WEIGHTS.copy()
+    weight_path = Path("weights.json")
+    if weight_path.exists():
+        weights.update(json.loads(weight_path.read_text()))
+    board["Model_Score"] = (
+        pd.to_numeric(board["Model_Score"], errors="coerce").fillna(0)
+        - old_env * weights["park_environment"]
+        + board["Park_Env_Score"] * weights["park_environment"]
+    )
+    board = board.sort_values(["Model_Score", "Qualifying_Power_Signals"], ascending=False)
+    board.to_csv(csv_path, index=False)
+    with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
+        board.to_excel(writer, sheet_name="Ranked Board", index=False)
+        board[board["Core_HR_Eligible"] == True].head(30).to_excel(writer, sheet_name="Core HR", index=False)
+        board.head(40).to_excel(writer, sheet_name="Top 40", index=False)
+    print(f"Weather refreshed: {csv_path}")
+    print(f"Weather refreshed: {xlsx_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Last-10-game MLB HR scanner")
     parser.add_argument("--date", default=str(date.today()), help="YYYY-MM-DD")
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--lookback-days", type=int, default=32)
+    parser.add_argument("--weather-only", action="store_true")
+    parser.add_argument("--no-auto-weather", action="store_true")
     parser.add_argument(
         "--include-unconfirmed",
         action="store_true",
         help="Screen active rosters when confirmed lineups are unavailable.",
     )
     args = parser.parse_args()
-    run(
-        game_date=args.date,
-        output_dir=Path(args.output_dir),
-        lookback_days=args.lookback_days,
-        include_unconfirmed=args.include_unconfirmed,
-    )
+    if args.weather_only:
+        refresh_weather_only(
+            game_date=args.date,
+            output_dir=Path(args.output_dir),
+            auto_weather=not args.no_auto_weather,
+        )
+    else:
+        run(
+            game_date=args.date,
+            output_dir=Path(args.output_dir),
+            lookback_days=args.lookback_days,
+            include_unconfirmed=args.include_unconfirmed,
+            auto_weather=not args.no_auto_weather,
+        )
 
 
 if __name__ == "__main__":

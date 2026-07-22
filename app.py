@@ -37,7 +37,7 @@ st.markdown(
 )
 
 st.title("⚾ Outlaw MLB Scanner")
-st.caption("Direct-Savant last-10 scanner — v3.2 Enhanced Matchup Top 40.")
+st.caption("Direct-Savant last-10 scanner — v3.3 Automatic Weather Top 40.")
 
 with st.expander("Scanner model", expanded=False):
     st.markdown(
@@ -47,8 +47,9 @@ with st.expander("Scanner model", expanded=False):
 
         The mobile build uses a **32-day source window** to reconstruct each
         hitter's 10 most recent games. Version 3.2 keeps the original V3 weights
-        while adding pitcher damage by batter side, recent HR pitch types,
-        pitch-usage compatibility, and velocity-band compatibility.
+        while adding pitcher damage by batter side, pitch compatibility,
+        automatic first-pitch weather, stadium-relative wind, rain warnings,
+        and conservative retractable-roof handling.
         """
     )
 
@@ -62,8 +63,14 @@ with c2:
         help="Use active rosters when confirmed batting orders are unavailable.",
     )
 
+auto_weather = st.toggle(
+    "Automatic first-pitch weather",
+    value=True,
+    help="Uses Open-Meteo hourly forecasts. Retractable roofs stay neutral until confirmed.",
+)
+
 st.subheader("Optional inputs")
-st.caption("Leave blank for neutral weather and market adjustments.")
+st.caption("Weather is automatic. Upload a CSV only to override roof status or a forecast value.")
 
 weather_upload = st.file_uploader(
     "Upload environment_inputs.csv",
@@ -85,7 +92,38 @@ if odds_upload is not None:
 if "last_error" not in st.session_state:
     st.session_state.last_error = ""
 
-if st.button("Run Full Scan", type="primary", use_container_width=True):
+refresh_col, scan_col = st.columns(2)
+refresh_weather_clicked = refresh_col.button(
+    "Refresh Weather Only",
+    use_container_width=True,
+    disabled=not (OUTPUT_DIR / f"outlaw_scanner_{scan_date.isoformat()}.csv").exists(),
+)
+run_full_clicked = scan_col.button(
+    "Run Full Scan", type="primary", use_container_width=True
+)
+
+if refresh_weather_clicked:
+    st.session_state.last_error = ""
+    weather_cmd = [
+        sys.executable, str(APP_DIR / "scanner.py"),
+        "--date", scan_date.isoformat(),
+        "--output-dir", str(OUTPUT_DIR),
+        "--weather-only",
+    ]
+    if not auto_weather:
+        weather_cmd.append("--no-auto-weather")
+    with st.status("Refreshing first-pitch weather...", expanded=True) as status:
+        process = subprocess.run(
+            weather_cmd, cwd=APP_DIR, capture_output=True, text=True, timeout=90
+        )
+        if process.returncode != 0:
+            status.update(label="Weather refresh failed", state="error")
+            st.session_state.last_error = (process.stderr or process.stdout)[-6000:]
+        else:
+            status.update(label="Weather refreshed", state="complete")
+            st.rerun()
+
+if run_full_clicked:
     st.session_state.last_error = ""
 
     cmd = [
@@ -100,6 +138,8 @@ if st.button("Run Full Scan", type="primary", use_container_width=True):
     ]
     if include_unconfirmed:
         cmd.append("--include-unconfirmed")
+    if not auto_weather:
+        cmd.append("--no-auto-weather")
 
     child_env = os.environ.copy()
     child_env.update({
@@ -179,7 +219,10 @@ if csv_path.exists():
             "Pitcher_PullAir_Damage_pct","Pitcher_Top_Pitches",
             "Pitcher_HR_Pitch_Types","Pitcher_Primary_Velo","Pitch_Mix_Score",
             "Pitch_Type_Matchup","Velocity_Matchup_Score","Velocity_Matchup",
-            "Park_Factor","Weather_Factor","HR_Odds_American"
+            "Park_Factor","Weather_Factor","game_time_utc","temp_f",
+            "humidity_pct","wind_speed_mph","wind_direction_deg",
+            "wind_out_mph","precip_probability_pct","roof_status",
+            "weather_warning","weather_source","HR_Odds_American"
         ]
         display_cols = [col for col in preferred if col in board.columns]
 

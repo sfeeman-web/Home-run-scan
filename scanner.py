@@ -175,8 +175,9 @@ def team_id_map() -> dict[str, int]:
 
 def _coerce_statcast_types(df: pd.DataFrame) -> pd.DataFrame:
     numeric_cols = [
-        "game_pk", "batter", "pitcher", "launch_speed", "launch_angle",
-        "hit_distance_sc", "hc_x", "hc_y", "bat_score", "post_bat_score"
+        "game_pk", "batter", "pitcher", "release_speed", "plate_x", "plate_z",
+        "launch_speed", "launch_angle", "hit_distance_sc", "hc_x", "hc_y",
+        "bat_score", "post_bat_score"
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -218,7 +219,8 @@ def _fetch_savant_day(day: str, probable_pitcher_ids: set[int]) -> pd.DataFrame:
 
     needed = [
         "game_date", "game_pk", "batter", "pitcher", "stand", "events",
-        "pitch_type", "launch_speed", "launch_angle", "hit_distance_sc",
+        "pitch_type", "release_speed", "plate_x", "plate_z", "description",
+        "launch_speed", "launch_angle", "hit_distance_sc",
         "hc_x", "hc_y", "bat_score", "post_bat_score"
     ]
     for col in needed:
@@ -427,62 +429,169 @@ def batted_ball_metrics(p: pd.DataFrame) -> dict[str, float]:
     }
 
 
-def pitcher_vulnerability(df: pd.DataFrame, pitcher_id: int | None, batter_stand: str) -> dict[str, float]:
-    if not pitcher_id:
-        return {
-            "Pitcher_BBE": np.nan, "Pitcher_HR": np.nan, "Pitcher_HR_pct": np.nan,
-            "Pitcher_HH_pct": np.nan, "Pitcher_Barrel_pct_approx": np.nan,
-            "Pitcher_Avg_EV": np.nan,
-        }
-    p = df[df["pitcher"] == pitcher_id].copy()
-    if batter_stand in {"L", "R"}:
-        p = p[p["stand"] == batter_stand]
-    b = p[is_bbe(p)].copy()
+def _empty_pitcher_metrics() -> dict[str, float | str]:
+    return {
+        "Pitcher_BBE": np.nan,
+        "Pitcher_BBE_Overall": np.nan,
+        "Pitcher_HR": np.nan,
+        "Pitcher_HR_Overall": np.nan,
+        "Pitcher_HR_pct": np.nan,
+        "Pitcher_HR_pct_Overall": np.nan,
+        "Pitcher_HH_pct": np.nan,
+        "Pitcher_HH_pct_Overall": np.nan,
+        "Pitcher_Barrel_pct_approx": np.nan,
+        "Pitcher_Barrel_pct_Overall": np.nan,
+        "Pitcher_Avg_EV": np.nan,
+        "Pitcher_Avg_EV_Overall": np.nan,
+        "Pitcher_FB_pct": np.nan,
+        "Pitcher_PullAir_Damage_pct": np.nan,
+        "Pitcher_Top_Pitches": "",
+        "Pitcher_HR_Pitch_Types": "",
+        "Pitcher_Primary_Velo": np.nan,
+    }
+
+
+def _pitcher_bbe_summary(rows: pd.DataFrame) -> dict[str, float]:
+    b = rows[is_bbe(rows)].copy()
     if b.empty:
         return {
-            "Pitcher_BBE": 0, "Pitcher_HR": 0, "Pitcher_HR_pct": np.nan,
-            "Pitcher_HH_pct": np.nan, "Pitcher_Barrel_pct_approx": np.nan,
-            "Pitcher_Avg_EV": np.nan,
+            "BBE": 0, "HR": 0, "HR_pct": np.nan, "HH_pct": np.nan,
+            "Barrel_pct": np.nan, "Avg_EV": np.nan, "FB_pct": np.nan,
+            "PullAir_Damage_pct": np.nan,
         }
-    b["barrel_approx"] = [
-        is_barrel_row(ev, la)
-        for ev, la in zip(
-            pd.to_numeric(b["launch_speed"], errors="coerce"),
-            pd.to_numeric(b["launch_angle"], errors="coerce"),
-        )
-    ]
+    ev = pd.to_numeric(b["launch_speed"], errors="coerce")
+    la = pd.to_numeric(b["launch_angle"], errors="coerce")
+    b["barrel_approx"] = [is_barrel_row(x, y) for x, y in zip(ev, la)]
+    air = la >= 10
+    pull = (
+        ((b["stand"] == "R") & (pd.to_numeric(b["hc_x"], errors="coerce") < 125))
+        | ((b["stand"] == "L") & (pd.to_numeric(b["hc_x"], errors="coerce") > 125))
+    )
+    damaging_pull_air = air & pull & ((ev >= 95) | (b["events"] == "home_run"))
     return {
-        "Pitcher_BBE": int(len(b)),
-        "Pitcher_HR": int((b["events"] == "home_run").sum()),
-        "Pitcher_HR_pct": float((b["events"] == "home_run").mean()),
-        "Pitcher_HH_pct": float((pd.to_numeric(b["launch_speed"], errors="coerce") >= 95).mean()),
-        "Pitcher_Barrel_pct_approx": float(b["barrel_approx"].mean()),
-        "Pitcher_Avg_EV": float(pd.to_numeric(b["launch_speed"], errors="coerce").mean()),
+        "BBE": int(len(b)),
+        "HR": int((b["events"] == "home_run").sum()),
+        "HR_pct": float((b["events"] == "home_run").mean()),
+        "HH_pct": float((ev >= 95).mean()),
+        "Barrel_pct": float(b["barrel_approx"].mean()),
+        "Avg_EV": float(ev.mean()),
+        "FB_pct": float((la >= 20).mean()),
+        "PullAir_Damage_pct": float(damaging_pull_air.mean()),
+    }
+
+
+def pitcher_vulnerability(df: pd.DataFrame, pitcher_id: int | None, batter_stand: str) -> dict[str, float | str]:
+    """Recent pitcher damage, both overall and versus the hitter's batting side."""
+    if not pitcher_id:
+        return _empty_pitcher_metrics()
+    p_all = df[df["pitcher"] == pitcher_id].copy()
+    if p_all.empty:
+        return _empty_pitcher_metrics()
+    p_side = p_all[p_all["stand"] == batter_stand].copy() if batter_stand in {"L", "R"} else p_all
+    overall = _pitcher_bbe_summary(p_all)
+    side = _pitcher_bbe_summary(p_side)
+
+    pitch_usage = p_all["pitch_type"].dropna().value_counts(normalize=True).head(4)
+    top_pitches = ", ".join(
+        f"{PITCH_GROUPS.get(pt, pt)} {usage:.0%}" for pt, usage in pitch_usage.items()
+    )
+    hr_rows = p_side[p_side["events"] == "home_run"]
+    hr_types = hr_rows["pitch_type"].dropna().value_counts()
+    hr_pitch_types = ", ".join(
+        f"{PITCH_GROUPS.get(pt, pt)} {int(count)}" for pt, count in hr_types.head(4).items()
+    )
+    primary_types = set(pitch_usage.head(2).index)
+    velo_rows = p_all[p_all["pitch_type"].isin(primary_types)] if primary_types else p_all
+    primary_velo = pd.to_numeric(velo_rows.get("release_speed"), errors="coerce").mean()
+
+    return {
+        "Pitcher_BBE": side["BBE"],
+        "Pitcher_BBE_Overall": overall["BBE"],
+        "Pitcher_HR": side["HR"],
+        "Pitcher_HR_Overall": overall["HR"],
+        "Pitcher_HR_pct": side["HR_pct"],
+        "Pitcher_HR_pct_Overall": overall["HR_pct"],
+        "Pitcher_HH_pct": side["HH_pct"],
+        "Pitcher_HH_pct_Overall": overall["HH_pct"],
+        "Pitcher_Barrel_pct_approx": side["Barrel_pct"],
+        "Pitcher_Barrel_pct_Overall": overall["Barrel_pct"],
+        "Pitcher_Avg_EV": side["Avg_EV"],
+        "Pitcher_Avg_EV_Overall": overall["Avg_EV"],
+        "Pitcher_FB_pct": side["FB_pct"],
+        "Pitcher_PullAir_Damage_pct": side["PullAir_Damage_pct"],
+        "Pitcher_Top_Pitches": top_pitches,
+        "Pitcher_HR_Pitch_Types": hr_pitch_types,
+        "Pitcher_Primary_Velo": float(primary_velo) if pd.notna(primary_velo) else np.nan,
+    }
+
+
+def _pitch_type_batter_score(rows: pd.DataFrame) -> tuple[float, int, float, float]:
+    b = rows[is_bbe(rows)].copy()
+    if b.empty:
+        return 50.0, 0, np.nan, np.nan
+    ev = pd.to_numeric(b["launch_speed"], errors="coerce")
+    la = pd.to_numeric(b["launch_angle"], errors="coerce")
+    barrels = np.array([is_barrel_row(x, y) for x, y in zip(ev, la)], dtype=float)
+    hr_rate = float((b["events"] == "home_run").mean())
+    hh = float((ev >= 95).mean())
+    barrel = float(np.nanmean(barrels)) if len(barrels) else 0.0
+    avg_ev = float(ev.mean())
+    score = np.clip((avg_ev - 82) * 3.2 + hh * 28 + barrel * 45 + hr_rate * 70, 0, 100)
+    return float(score), int(len(b)), avg_ev, barrel
+
+
+def pitch_mix_matchup_details(batter_rows: pd.DataFrame, pitcher_rows: pd.DataFrame) -> dict[str, float | str]:
+    """Match batter damage to the pitcher's actual recent pitch usage and velocity."""
+    if pitcher_rows.empty:
+        return {
+            "Pitch_Mix_Score": 50.0, "Pitch_Type_Matchup": "No pitcher sample",
+            "Velocity_Matchup_Score": 50.0, "Velocity_Matchup": "No velocity sample",
+        }
+    pitcher_usage = pitcher_rows["pitch_type"].dropna().value_counts(normalize=True).head(5)
+    if pitcher_usage.empty:
+        return {
+            "Pitch_Mix_Score": 50.0, "Pitch_Type_Matchup": "No pitch mix",
+            "Velocity_Matchup_Score": 50.0, "Velocity_Matchup": "No velocity sample",
+        }
+
+    weighted_scores, weights, detail_parts = [], [], []
+    for pitch_type, usage in pitcher_usage.items():
+        score, sample, avg_ev, barrel = _pitch_type_batter_score(
+            batter_rows[batter_rows["pitch_type"] == pitch_type]
+        )
+        reliability = min(sample / 12.0, 1.0)
+        adjusted = 50 + (score - 50) * reliability
+        weighted_scores.append(adjusted)
+        weights.append(float(usage))
+        label = PITCH_GROUPS.get(pitch_type, pitch_type)
+        detail_parts.append(f"{label} {usage:.0%}: {adjusted:.0f} ({sample} BBE)")
+    pitch_score = float(np.average(weighted_scores, weights=weights))
+
+    # Velocity compatibility: compare batter damage in the pitcher's primary velocity band.
+    pitcher_velo = pd.to_numeric(pitcher_rows.get("release_speed"), errors="coerce").dropna()
+    primary_velo = float(pitcher_velo.mean()) if not pitcher_velo.empty else np.nan
+    if pd.isna(primary_velo):
+        velo_score, velo_text = 50.0, "No velocity sample"
+    else:
+        batter_velo = pd.to_numeric(batter_rows.get("release_speed"), errors="coerce")
+        band_rows = batter_rows[batter_velo.between(primary_velo - 1.5, primary_velo + 1.5)]
+        raw_velo_score, sample, avg_ev, barrel = _pitch_type_batter_score(band_rows)
+        reliability = min(sample / 15.0, 1.0)
+        velo_score = float(50 + (raw_velo_score - 50) * reliability)
+        velo_text = f"{primary_velo:.1f} mph band: {velo_score:.0f} ({sample} BBE)"
+
+    # Preserve V3's 15% category, but improve its input by blending pitch type and velocity fit.
+    combined = float(np.clip(pitch_score * 0.80 + velo_score * 0.20, 0, 100))
+    return {
+        "Pitch_Mix_Score": combined,
+        "Pitch_Type_Matchup": " | ".join(detail_parts),
+        "Velocity_Matchup_Score": velo_score,
+        "Velocity_Matchup": velo_text,
     }
 
 
 def pitch_mix_matchup_score(batter_rows: pd.DataFrame, pitcher_rows: pd.DataFrame) -> float:
-    """
-    Score 0-100 using batter damage on the pitcher's most-used pitch types.
-    This is a transparent matchup score, not a proprietary projection.
-    """
-    pitcher_usage = pitcher_rows["pitch_type"].value_counts(normalize=True).head(4)
-    if pitcher_usage.empty:
-        return 50.0
-    scores = []
-    weights = []
-    for pitch_type, usage in pitcher_usage.items():
-        b = batter_rows[(batter_rows["pitch_type"] == pitch_type) & is_bbe(batter_rows)].copy()
-        if b.empty:
-            score = 50.0
-        else:
-            ev = pd.to_numeric(b["launch_speed"], errors="coerce").mean()
-            hh = (pd.to_numeric(b["launch_speed"], errors="coerce") >= 95).mean()
-            score = np.clip((ev - 82) * 4.0 + hh * 35, 0, 100)
-        scores.append(score)
-        weights.append(float(usage))
-    return float(np.average(scores, weights=weights))
-
+    return float(pitch_mix_matchup_details(batter_rows, pitcher_rows)["Pitch_Mix_Score"])
 
 def normalize_series(s: pd.Series, low: float = 0, high: float = 100) -> pd.Series:
     s = pd.to_numeric(s, errors="coerce")
@@ -504,10 +613,12 @@ def add_model_scores(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFram
         + out["Near_HR"].fillna(0) * 2.5
     )
     pitcher_raw = (
-        out["Pitcher_HR_pct"].fillna(0) * 100 * 0.35
-        + out["Pitcher_HH_pct"].fillna(0) * 100 * 0.30
-        + out["Pitcher_Barrel_pct_approx"].fillna(0) * 100 * 0.25
-        + out["Pitcher_Avg_EV"].fillna(85) * 0.10
+        out["Pitcher_HR_pct"].fillna(out["Pitcher_HR_pct_Overall"]).fillna(0) * 100 * 0.30
+        + out["Pitcher_HH_pct"].fillna(out["Pitcher_HH_pct_Overall"]).fillna(0) * 100 * 0.22
+        + out["Pitcher_Barrel_pct_approx"].fillna(out["Pitcher_Barrel_pct_Overall"]).fillna(0) * 100 * 0.22
+        + out["Pitcher_FB_pct"].fillna(0) * 100 * 0.10
+        + out["Pitcher_PullAir_Damage_pct"].fillna(0) * 100 * 0.08
+        + out["Pitcher_Avg_EV"].fillna(out["Pitcher_Avg_EV_Overall"]).fillna(85) * 0.08
     )
     due_raw = (
         out["xHR_minus_HR"].fillna(0) * 20
@@ -609,7 +720,15 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
                 pv = pitcher_vulnerability(season_sc, pitcher_id, stand)
                 batter_season = season_sc[season_sc["batter"] == pid]
                 pitcher_season = season_sc[season_sc["pitcher"] == pitcher_id] if pitcher_id else pd.DataFrame()
-                pitch_score = pitch_mix_matchup_score(batter_season, pitcher_season) if pitcher_id else 50.0
+                pitch_details = (
+                    pitch_mix_matchup_details(batter_season, pitcher_season)
+                    if pitcher_id else {
+                        "Pitch_Mix_Score": 50.0,
+                        "Pitch_Type_Matchup": "No confirmed pitcher",
+                        "Velocity_Matchup_Score": 50.0,
+                        "Velocity_Matchup": "No confirmed pitcher",
+                    }
+                )
 
                 park_factor = PARK_FACTORS.get(park_team, 1.0)
                 weather_factor = 1.0
@@ -658,7 +777,7 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
                     "wind_out_mph": wind_out_mph,
                     "HR_Odds_American": hr_odds,
                     "Market_Value_Score": market_value,
-                    "Pitch_Mix_Score": pitch_score,
+                    **pitch_details,
                     **production,
                     **contact,
                     **pv,
@@ -676,7 +795,10 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
 
     pct_cols = [
         "HH_pct", "Barrel_pct_approx", "SweetSpot_pct", "PullAir_pct",
-        "Pitcher_HR_pct", "Pitcher_HH_pct", "Pitcher_Barrel_pct_approx"
+        "Pitcher_HR_pct", "Pitcher_HR_pct_Overall",
+        "Pitcher_HH_pct", "Pitcher_HH_pct_Overall",
+        "Pitcher_Barrel_pct_approx", "Pitcher_Barrel_pct_Overall",
+        "Pitcher_FB_pct", "Pitcher_PullAir_Damage_pct"
     ]
     for c in pct_cols:
         if c in board:
@@ -691,9 +813,14 @@ def run(game_date: str, output_dir: Path, lookback_days: int = 32, include_uncon
         "Avg_LA", "SweetSpot", "SweetSpot_pct", "PullAir", "PullAir_pct",
         "Fly_350_plus", "Fly_375_plus", "Out_380_400", "Near_HR",
         "xHR_proxy", "xHR_minus_HR",
-        "Pitcher_BBE", "Pitcher_HR", "Pitcher_HR_pct", "Pitcher_HH_pct",
-        "Pitcher_Barrel_pct_approx", "Pitcher_Avg_EV",
-        "Pitch_Mix_Score", "Park_Factor", "Weather_Factor",
+        "Pitcher_BBE", "Pitcher_BBE_Overall", "Pitcher_HR", "Pitcher_HR_Overall",
+        "Pitcher_HR_pct", "Pitcher_HR_pct_Overall", "Pitcher_HH_pct",
+        "Pitcher_HH_pct_Overall", "Pitcher_Barrel_pct_approx",
+        "Pitcher_Barrel_pct_Overall", "Pitcher_Avg_EV", "Pitcher_Avg_EV_Overall",
+        "Pitcher_FB_pct", "Pitcher_PullAir_Damage_pct", "Pitcher_Top_Pitches",
+        "Pitcher_HR_Pitch_Types", "Pitcher_Primary_Velo", "Pitch_Mix_Score",
+        "Pitch_Type_Matchup", "Velocity_Matchup_Score", "Velocity_Matchup",
+        "Park_Factor", "Weather_Factor",
         "temp_f", "wind_out_mph", "roof_status",
         "HR_Odds_American", "Market_Value_Score",
         "Contact_Score", "Pitcher_Vuln_Score", "Park_Env_Score", "Due_Score",

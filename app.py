@@ -37,7 +37,7 @@ st.markdown(
 )
 
 st.title("⚾ Outlaw MLB Scanner")
-st.caption("Direct-Savant last-10 Statcast scanner — v3.1 Top 40.")
+st.caption("Direct-Savant last-10 scanner — v3.2 Enhanced Matchup Top 40.")
 
 with st.expander("Scanner model", expanded=False):
     st.markdown(
@@ -46,8 +46,9 @@ with st.expander("Scanner model", expanded=False):
         15% pitch mix, 15% environment, 10% due indicators and 5% value.
 
         The mobile build uses a **32-day source window** to reconstruct each
-        hitter's 10 most recent games. Pitcher vulnerability also uses this
-        recent window so the app does not download the entire season twice.
+        hitter's 10 most recent games. Version 3.2 keeps the original V3 weights
+        while adding pitcher damage by batter side, recent HR pitch types,
+        pitch-usage compatibility, and velocity-band compatibility.
         """
     )
 
@@ -173,8 +174,12 @@ if csv_path.exists():
             "Barrels_approx","Barrel_pct_approx","Avg_LA",
             "SweetSpot_pct","PullAir_pct","Fly_350_plus","Fly_375_plus",
             "Out_380_400","Near_HR","xHR_proxy","xHR_minus_HR",
-            "Pitcher_HR_pct","Pitcher_HH_pct","Pitcher_Barrel_pct_approx",
-            "Pitch_Mix_Score","Park_Factor","Weather_Factor","HR_Odds_American"
+            "Pitcher_BBE","Pitcher_HR_pct","Pitcher_HR_pct_Overall",
+            "Pitcher_HH_pct","Pitcher_Barrel_pct_approx","Pitcher_FB_pct",
+            "Pitcher_PullAir_Damage_pct","Pitcher_Top_Pitches",
+            "Pitcher_HR_Pitch_Types","Pitcher_Primary_Velo","Pitch_Mix_Score",
+            "Pitch_Type_Matchup","Velocity_Matchup_Score","Velocity_Matchup",
+            "Park_Factor","Weather_Factor","HR_Odds_American"
         ]
         display_cols = [col for col in preferred if col in board.columns]
 

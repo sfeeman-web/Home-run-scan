@@ -848,78 +848,6 @@ def add_model_scores(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFram
     return out.sort_values(["Model_Score", "Qualifying_Power_Signals"], ascending=False)
 
 
-def apply_matchup_first_overlay(
-    board: pd.DataFrame,
-    individual_weight: float = 0.75,
-    matchup_weight: float = 0.25,
-) -> pd.DataFrame:
-    """Blend the original V3 score with offense-specific matchup attackability."""
-    out = board.copy()
-
-    out["Individual_Model_Score"] = pd.to_numeric(
-        out["Model_Score"], errors="coerce"
-    ).fillna(50.0)
-
-    pitcher_score = pd.to_numeric(
-        out["Pitcher_Vuln_Score"], errors="coerce"
-    ).fillna(50.0)
-    environment_score = pd.to_numeric(
-        out["Park_Env_Score"], errors="coerce"
-    ).fillna(50.0)
-
-    raw_attackability = pitcher_score * 0.70 + environment_score * 0.30
-
-    matchup_keys = [
-        c for c in ["game_pk", "team", "opponent", "opposing_pitcher_id"]
-        if c in out.columns
-    ]
-
-    if matchup_keys:
-        out["Game_Attackability_Score"] = raw_attackability.groupby(
-            [out[c] for c in matchup_keys], dropna=False
-        ).transform("mean")
-    else:
-        out["Game_Attackability_Score"] = raw_attackability
-
-    out["Game_Attackability_Score"] = pd.to_numeric(
-        out["Game_Attackability_Score"], errors="coerce"
-    ).fillna(50.0).clip(0, 100)
-
-    out["Model_Score"] = (
-        out["Individual_Model_Score"] * individual_weight
-        + out["Game_Attackability_Score"] * matchup_weight
-    ).clip(0, 100)
-
-    if matchup_keys:
-        out["Matchup_Hitter_Rank"] = (
-            out.groupby(matchup_keys, dropna=False)["Model_Score"]
-            .rank(method="first", ascending=False)
-            .astype("Int64")
-        )
-    else:
-        out["Matchup_Hitter_Rank"] = pd.Series(
-            range(1, len(out) + 1), index=out.index, dtype="Int64"
-        )
-
-    lineup_spot = pd.to_numeric(out.get("lineup_spot"), errors="coerce").fillna(9)
-    out["Matchup_Cluster_Pick"] = (
-        (out["Game_Attackability_Score"] >= 60)
-        & (out["Matchup_Hitter_Rank"] <= 2)
-        & (lineup_spot <= 6)
-    )
-
-    out["Attackability_Grade"] = pd.cut(
-        out["Game_Attackability_Score"],
-        bins=[-1, 44.999, 54.999, 64.999, 74.999, 100],
-        labels=["Avoid", "Neutral", "Attackable", "Strong", "Pinata"],
-    ).astype(str)
-
-    return out.sort_values(
-        ["Model_Score", "Game_Attackability_Score", "Qualifying_Power_Signals"],
-        ascending=[False, False, False],
-    )
-
-
 def load_optional_inputs(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
@@ -1063,7 +991,6 @@ def run(
             "Run with --include-unconfirmed for active-roster screening."
         )
     board = add_model_scores(board, weights)
-    board = apply_matchup_first_overlay(board)
     gc.collect()
 
     pct_cols = [
@@ -1078,9 +1005,7 @@ def run(
             board[c] = board[c] * 100
 
     ordered = [
-        "Model_Score", "Individual_Model_Score", "Game_Attackability_Score",
-        "Attackability_Grade", "Matchup_Hitter_Rank", "Matchup_Cluster_Pick",
-        "Core_HR_Eligible", "Qualifying_Power_Signals",
+        "Model_Score", "Core_HR_Eligible", "Qualifying_Power_Signals",
         "player", "team", "opponent", "lineup_spot", "position", "bat_side",
         "opposing_pitcher", "G", "PA", "AB", "AVG", "H", "HR", "R", "RBI", "TB",
         "BBE", "Avg_EV", "EV90", "Max_EV", "HH_95", "HH_pct",
@@ -1111,19 +1036,12 @@ def run(
     board.to_csv(csv_path, index=False)
     with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
         board.to_excel(writer, sheet_name="Ranked Board", index=False)
-        clusters = board[board["Matchup_Cluster_Pick"] == True].head(40)
-        clusters.to_excel(writer, sheet_name="Matchup Clusters", index=False)
         core = board[board["Core_HR_Eligible"] == True].head(30)
         core.to_excel(writer, sheet_name="Core HR", index=False)
         top40 = board.head(40)
         top40.to_excel(writer, sheet_name="Top 40", index=False)
         workbook = writer.book
-        for sheet_name, frame in [
-            ("Ranked Board", board),
-            ("Matchup Clusters", clusters),
-            ("Core HR", core),
-            ("Top 40", top40),
-        ]:
+        for sheet_name, frame in [("Ranked Board", board), ("Core HR", core), ("Top 40", top40)]:
             ws = writer.sheets[sheet_name]
             ws.freeze_panes(1, 4)
             ws.autofilter(0, 0, max(len(frame), 1), max(len(frame.columns) - 1, 0))
@@ -1177,25 +1095,16 @@ def refresh_weather_only(game_date: str, output_dir: Path, auto_weather: bool = 
     weight_path = Path("weights.json")
     if weight_path.exists():
         weights.update(json.loads(weight_path.read_text()))
-    individual = pd.to_numeric(
-        board.get("Individual_Model_Score", board.get("Model_Score")),
-        errors="coerce",
-    ).fillna(50)
     board["Model_Score"] = (
-        individual
+        pd.to_numeric(board["Model_Score"], errors="coerce").fillna(0)
         - old_env * weights["park_environment"]
         + board["Park_Env_Score"] * weights["park_environment"]
     )
-    board = apply_matchup_first_overlay(board)
+    board = board.sort_values(["Model_Score", "Qualifying_Power_Signals"], ascending=False)
     board.to_csv(csv_path, index=False)
     with pd.ExcelWriter(xlsx_path, engine="xlsxwriter") as writer:
         board.to_excel(writer, sheet_name="Ranked Board", index=False)
-        board[board["Matchup_Cluster_Pick"] == True].head(40).to_excel(
-            writer, sheet_name="Matchup Clusters", index=False
-        )
-        board[board["Core_HR_Eligible"] == True].head(30).to_excel(
-            writer, sheet_name="Core HR", index=False
-        )
+        board[board["Core_HR_Eligible"] == True].head(30).to_excel(writer, sheet_name="Core HR", index=False)
         board.head(40).to_excel(writer, sheet_name="Top 40", index=False)
     print(f"Weather refreshed: {csv_path}")
     print(f"Weather refreshed: {xlsx_path}")

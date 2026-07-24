@@ -37,7 +37,7 @@ st.markdown(
 )
 
 st.title("⚾ Outlaw MLB Scanner")
-st.caption("Direct-Savant last-10 scanner — v3.3 Automatic Weather Top 40.")
+st.caption("Direct-Savant scanner — v3.4 Matchup-First Top 40.")
 
 with st.expander("Scanner model", expanded=False):
     st.markdown(
@@ -48,8 +48,9 @@ with st.expander("Scanner model", expanded=False):
         The mobile build uses a **32-day source window** to reconstruct each
         hitter's 10 most recent games. Version 3.2 keeps the original V3 weights
         while adding pitcher damage by batter side, pitch compatibility,
-        automatic first-pitch weather, stadium-relative wind, rain warnings,
-        and conservative retractable-roof handling.
+        automatic first-pitch weather, and a matchup-first overlay. The original
+        V3 individual score remains 75% of the final grade, while offense-specific
+        starter and environment attackability contributes 25%.
         """
     )
 
@@ -207,7 +208,10 @@ if csv_path.exists():
         m3.metric("Top score", f"{top_score:.1f}" if pd.notna(top_score) else "—")
 
         preferred = [
-            "Model_Score","Core_HR_Eligible","Qualifying_Power_Signals",
+            "Model_Score","Individual_Model_Score",
+            "Game_Attackability_Score","Attackability_Grade",
+            "Matchup_Hitter_Rank","Matchup_Cluster_Pick",
+            "Core_HR_Eligible","Qualifying_Power_Signals",
             "player","team","opponent","lineup_spot","opposing_pitcher",
             "AVG","H","HR","RBI","TB","Avg_EV","EV90","Max_EV",
             "HH_95","HH_pct","EV_100_plus","EV_100_plus_outs",
@@ -226,7 +230,7 @@ if csv_path.exists():
         ]
         display_cols = [col for col in preferred if col in board.columns]
 
-        tab1, tab2, tab3 = st.tabs(["Top 40", "Core HR", "Full board"])
+        tab1, tab2, tab3, tab4 = st.tabs(["Top 40", "Matchup Clusters", "Core HR", "Full board"])
         with tab1:
             st.dataframe(
                 board[display_cols].head(40),
@@ -235,6 +239,20 @@ if csv_path.exists():
                 height=650,
             )
         with tab2:
+            if "Matchup_Cluster_Pick" not in board:
+                st.info("Matchup cluster field is unavailable.")
+            else:
+                clusters = board[board["Matchup_Cluster_Pick"] == True]
+                if clusters.empty:
+                    st.info("No offenses currently meet the matchup-cluster threshold.")
+                else:
+                    st.dataframe(
+                        clusters[display_cols].head(40),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=650,
+                    )
+        with tab3:
             if "Core_HR_Eligible" not in board:
                 st.info("Core-HR field is unavailable.")
             else:
@@ -248,7 +266,7 @@ if csv_path.exists():
                         hide_index=True,
                         height=650,
                     )
-        with tab3:
+        with tab4:
             st.dataframe(
                 board[display_cols],
                 use_container_width=True,

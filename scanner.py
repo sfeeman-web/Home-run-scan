@@ -914,6 +914,92 @@ def apply_matchup_first_overlay(
         labels=["Avoid", "Neutral", "Attackable", "Strong", "Pinata"],
     ).astype(str)
 
+    # Visual hot-form indicator. This does not alter the model score.
+    recent_hr = pd.to_numeric(out.get("HR"), errors="coerce").fillna(0)
+    barrels = pd.to_numeric(out.get("Barrels_approx"), errors="coerce").fillna(0)
+    ev100 = pd.to_numeric(out.get("EV_100_plus"), errors="coerce").fillna(0)
+    deep_375 = pd.to_numeric(out.get("Fly_375_plus"), errors="coerce").fillna(0)
+    near_hr = pd.to_numeric(out.get("Near_HR"), errors="coerce").fillna(0)
+
+    out["Hot_Points"] = (
+        (recent_hr >= 1).astype(int)
+        + (recent_hr >= 3).astype(int)
+        + (barrels >= 3).astype(int)
+        + (barrels >= 5).astype(int)
+        + (ev100 >= 8).astype(int)
+        + (deep_375 >= 3).astype(int)
+        + (near_hr >= 2).astype(int)
+    )
+
+    out["Hot_Symbol"] = pd.cut(
+        out["Hot_Points"],
+        bins=[-1, 1, 3, 5, 99],
+        labels=["", "🔥", "🔥🔥", "🔥🔥🔥"],
+    ).astype(str)
+
+    # Platoon marker:
+    # *  = opposite-handed batter/pitcher matchup
+    # ** = switch hitter
+    batter_side = out.get("stand", pd.Series("", index=out.index)).fillna("").astype(str).str.upper()
+    pitcher_side = out.get("p_throws", pd.Series("", index=out.index)).fillna("").astype(str).str.upper()
+
+    out["Platoon_Marker"] = ""
+    out.loc[batter_side.eq("S"), "Platoon_Marker"] = "**"
+    opposite_hand = (
+        ((batter_side.eq("L")) & (pitcher_side.eq("R")))
+        | ((batter_side.eq("R")) & (pitcher_side.eq("L")))
+    )
+    out.loc[opposite_hand & ~batter_side.eq("S"), "Platoon_Marker"] = "*"
+
+    # Preserve the original player name and add a display name with symbols.
+    player_col = "player_name" if "player_name" in out.columns else "Player"
+    if player_col in out.columns:
+        out["Player_Display"] = (
+            out[player_col].fillna("").astype(str)
+            + out["Platoon_Marker"].fillna("")
+            + " "
+            + out["Hot_Symbol"].fillna("")
+        ).str.strip()
+
+    # Hitter-specific matchup label. This is display-only and does not change score.
+    pitch_match = pd.to_numeric(out.get("Pitch_Mix_Score"), errors="coerce").fillna(50)
+    pitcher_vuln = pd.to_numeric(out.get("Pitcher_Vuln_Score"), errors="coerce").fillna(50)
+    contact = pd.to_numeric(out.get("Contact_Score"), errors="coerce").fillna(50)
+
+    out["Best_Matchup_Score"] = (
+        pitch_match * 0.40
+        + pitcher_vuln * 0.35
+        + contact * 0.25
+    ).clip(0, 100)
+
+    if matchup_keys:
+        out["Best_Matchup_Rank"] = (
+            out.groupby(matchup_keys, dropna=False)["Best_Matchup_Score"]
+            .rank(method="first", ascending=False)
+            .astype("Int64")
+        )
+    else:
+        out["Best_Matchup_Rank"] = pd.Series(
+            range(1, len(out) + 1), index=out.index, dtype="Int64"
+        )
+
+    out["Best_Matchup"] = (
+        (out["Best_Matchup_Rank"] == 1)
+        & (out["Best_Matchup_Score"] >= 65)
+        & (lineup_spot <= 6)
+    )
+
+    out["Matchup_Label"] = ""
+    out.loc[out["Best_Matchup"], "Matchup_Label"] = "BEST MATCHUP"
+    out.loc[
+        (~out["Best_Matchup"]) & (out["Best_Matchup_Score"] >= 72),
+        "Matchup_Label",
+    ] = "ELITE MATCHUP"
+    out.loc[
+        (out["Matchup_Label"] == "") & (out["Best_Matchup_Score"] >= 62),
+        "Matchup_Label",
+    ] = "GOOD MATCHUP"
+
     return out.sort_values(
         ["Model_Score", "Game_Attackability_Score", "Qualifying_Power_Signals"],
         ascending=[False, False, False],
@@ -1078,8 +1164,11 @@ def run(
             board[c] = board[c] * 100
 
     ordered = [
-        "Model_Score", "Individual_Model_Score", "Game_Attackability_Score",
-        "Attackability_Grade", "Matchup_Hitter_Rank", "Matchup_Cluster_Pick",
+        "Player_Display", "Hot_Symbol", "Platoon_Marker",
+        "Matchup_Label", "Best_Matchup", "Best_Matchup_Score",
+        "Best_Matchup_Rank", "Model_Score", "Individual_Model_Score",
+        "Game_Attackability_Score", "Attackability_Grade",
+        "Matchup_Hitter_Rank", "Matchup_Cluster_Pick",
         "Core_HR_Eligible", "Qualifying_Power_Signals",
         "player", "team", "opponent", "lineup_spot", "position", "bat_side",
         "opposing_pitcher", "G", "PA", "AB", "AVG", "H", "HR", "R", "RBI", "TB",

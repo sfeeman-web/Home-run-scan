@@ -1000,6 +1000,122 @@ def apply_matchup_first_overlay(
         "Matchup_Label",
     ] = "GOOD MATCHUP"
 
+    # Final recommendation resolves apparently conflicting labels.
+    core_flag = out.get(
+        "Core_HR_Eligible", pd.Series(False, index=out.index)
+    ).fillna(False).astype(bool)
+    hot_level = pd.to_numeric(out["Hot_Points"], errors="coerce").fillna(0)
+    attackability = pd.to_numeric(
+        out["Game_Attackability_Score"], errors="coerce"
+    ).fillna(50)
+    matchup_score = pd.to_numeric(
+        out["Best_Matchup_Score"], errors="coerce"
+    ).fillna(50)
+    model_score = pd.to_numeric(out["Model_Score"], errors="coerce").fillna(50)
+
+    out["Final_Recommendation"] = "NEUTRAL"
+
+    out.loc[
+        core_flag
+        & (attackability >= 55)
+        & (matchup_score >= 62),
+        "Final_Recommendation",
+    ] = "🟢 CORE PLAY"
+
+    out.loc[
+        (out["Final_Recommendation"] == "NEUTRAL")
+        & (hot_level >= 4)
+        & (matchup_score >= 65)
+        & (attackability >= 50),
+        "Final_Recommendation",
+    ] = "🟢 STRONG WATCH"
+
+    out.loc[
+        (out["Final_Recommendation"] == "NEUTRAL")
+        & (hot_level >= 2)
+        & (matchup_score >= 62)
+        & (attackability < 45),
+        "Final_Recommendation",
+    ] = "🟡 HOT — TOUGH PITCHER"
+
+    out.loc[
+        (out["Final_Recommendation"] == "NEUTRAL")
+        & (hot_level >= 2)
+        & (attackability.between(45, 54.999)),
+        "Final_Recommendation",
+    ] = "🟠 VALUE ONLY"
+
+    out.loc[
+        (out["Final_Recommendation"] == "NEUTRAL")
+        & (matchup_score >= 65)
+        & (hot_level < 2)
+        & (attackability >= 45),
+        "Final_Recommendation",
+    ] = "🟡 MATCHUP ONLY"
+
+    out.loc[
+        (out["Final_Recommendation"] == "NEUTRAL")
+        & (model_score >= 68)
+        & (attackability >= 55),
+        "Final_Recommendation",
+    ] = "🟡 WATCH"
+
+    out.loc[
+        (out["Final_Recommendation"] == "NEUTRAL")
+        & (attackability < 45)
+        & (matchup_score < 62)
+        & (hot_level < 2),
+        "Final_Recommendation",
+    ] = "🔴 FADE"
+
+    def recommendation_reason(row: pd.Series) -> str:
+        reasons: list[str] = []
+
+        hot_points = float(row.get("Hot_Points", 0) or 0)
+        matchup = float(row.get("Best_Matchup_Score", 50) or 50)
+        attack = float(row.get("Game_Attackability_Score", 50) or 50)
+        weather_factor = float(row.get("Weather_Factor", 1.0) or 1.0)
+        park_factor = float(row.get("Park_Factor", 1.0) or 1.0)
+        marker = str(row.get("Platoon_Marker", "") or "")
+
+        if hot_points >= 4:
+            reasons.append("🔥 elite recent form")
+        elif hot_points >= 2:
+            reasons.append("🔥 hot recent form")
+
+        if bool(row.get("Best_Matchup", False)):
+            reasons.append("⭐ best pitch fit")
+        elif matchup >= 72:
+            reasons.append("elite pitch fit")
+        elif matchup >= 62:
+            reasons.append("good pitch fit")
+
+        if marker == "**":
+            reasons.append("switch hitter")
+        elif marker == "*":
+            reasons.append("platoon edge")
+
+        if attack >= 75:
+            reasons.append("piñata pitcher/game")
+        elif attack >= 65:
+            reasons.append("strong pitcher attack")
+        elif attack < 45:
+            reasons.append("tough pitcher/game")
+
+        if park_factor >= 1.08:
+            reasons.append("park upgrade")
+        if weather_factor >= 1.04:
+            reasons.append("weather boost")
+        elif weather_factor <= 0.96:
+            reasons.append("weather downgrade")
+
+        if not reasons:
+            reasons.append("mixed indicators")
+
+        return " | ".join(reasons[:4])
+
+    out["Why"] = out.apply(recommendation_reason, axis=1)
+
     return out.sort_values(
         ["Model_Score", "Game_Attackability_Score", "Qualifying_Power_Signals"],
         ascending=[False, False, False],
@@ -1164,7 +1280,8 @@ def run(
             board[c] = board[c] * 100
 
     ordered = [
-        "Player_Display", "Hot_Symbol", "Platoon_Marker",
+        "Player_Display", "Final_Recommendation", "Why",
+        "Hot_Symbol", "Platoon_Marker",
         "Matchup_Label", "Best_Matchup", "Best_Matchup_Score",
         "Best_Matchup_Rank", "Model_Score", "Individual_Model_Score",
         "Game_Attackability_Score", "Attackability_Grade",

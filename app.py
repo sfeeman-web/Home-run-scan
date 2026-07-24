@@ -37,7 +37,7 @@ st.markdown(
 )
 
 st.title("⚾ Outlaw MLB Scanner")
-st.caption("Direct-Savant scanner — v3.5 Hot Form + Best Matchup.")
+st.caption("Direct-Savant scanner — v3.6 Final Recommendation.")
 
 with st.expander("Scanner model", expanded=False):
     st.markdown(
@@ -208,7 +208,8 @@ if csv_path.exists():
         m3.metric("Top score", f"{top_score:.1f}" if pd.notna(top_score) else "—")
 
         preferred = [
-            "Player_Display","Hot_Symbol","Platoon_Marker",
+            "Player_Display","Final_Recommendation","Why",
+            "Hot_Symbol","Platoon_Marker",
             "Matchup_Label","Best_Matchup","Best_Matchup_Score",
             "Model_Score","Individual_Model_Score",
             "Game_Attackability_Score","Attackability_Grade",
@@ -234,8 +235,10 @@ if csv_path.exists():
 
 
         st.caption(
-            "🔥 = hot recent power/contact | * = platoon advantage | "
-            "** = switch hitter | BEST MATCHUP = strongest hitter-pitcher fit in that offense"
+            "Final recommendation resolves all signals: "
+            "🟢 Core/Strong Watch | 🟡 Watch or Hot–Tough Pitcher | "
+            "🟠 Value Only | 🔴 Fade. "
+            "🔥 = hot form | * = platoon edge | ** = switch hitter."
         )
 
         tab1, tab2, tab3, tab4 = st.tabs(["Top 40", "Matchup Clusters", "Core HR", "Full board"])
